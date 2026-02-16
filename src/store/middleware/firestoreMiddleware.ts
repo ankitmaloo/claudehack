@@ -5,6 +5,7 @@ import {
   saveStructuredEvents,
   saveRunResult,
   saveRunRubric,
+  saveRunPlan,
   updateRunStatus as updateRunStatusFirestore,
   createVersionDoc,
   saveVersionResult,
@@ -42,12 +43,20 @@ export const firestoreMiddleware: Middleware = (storeApi) => (next) => (action: 
       const { runId, events, versionId } = payload as {
         runId: string; events: import('@/types').SSEEvent[]; versionId?: string;
       };
-      // Save rubric to run doc when it arrives (mid-stream)
+      // Save rubric and plan to run doc when they arrive (mid-stream)
       if (!versionId) {
         const rubricEvent = events.find((e) => e.type === 'rubric');
         if (rubricEvent && 'content' in rubricEvent) {
           saveRunRubric(runId, rubricEvent.content as string).catch((err) =>
             console.error('Failed to save rubric:', err)
+          );
+        }
+
+        const planEvent = events.find((e) => e.type === 'plan_created');
+        if (planEvent && 'brief' in planEvent && 'plan' in planEvent) {
+          const pe = planEvent as { brief: string; plan: string };
+          saveRunPlan(runId, { brief: pe.brief, plan: pe.plan }).catch((err) =>
+            console.error('Failed to save plan:', err)
           );
         }
       }

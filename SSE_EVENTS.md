@@ -26,6 +26,7 @@ Events come in two flavors:
 ```
 run_start
 ├── rubric?                  ← only if client sent rubric in request
+├── plan_created?            ← plan mode only: auto-generated brief + plan (when no plan provided)
 ├── brief_start              ← instruction sent to brief creator (all providers)
 │   ├── brief_chunk*         ← streaming brief text (Gemini only)
 │   └── brief                ← complete brief payload
@@ -92,6 +93,26 @@ First event. Emitted once.
 | `task` | `string` | Echo of the task. |
 | `mode` | `string` | `"standard"` \| `"plan"` \| `"explore"` |
 | `sandbox` | `object?` | Only present when `sandbox_mode=true`. Echoes `sandbox_config`. |
+
+---
+
+### 1b. `plan_created`
+
+Emitted in plan mode when no `plan` was provided in the request. The server auto-generates a brief and plan before execution begins. Fires once, right after `run_start`.
+
+```json
+{
+  "brief": "# Brief\n\n## Objective\n...",
+  "plan": "# Execution Plan\n\n## Approach\n..."
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `brief` | `string` | Full brief markdown generated from the task via `BRIEF_CREATOR`. |
+| `plan` | `string` | Full execution plan markdown generated from the brief via `PLAN_CREATOR`. |
+
+> The generated plan is then passed to the orchestrator for execution. If the client provides a `plan` in the request, this event is skipped entirely.
 
 ---
 
@@ -264,7 +285,7 @@ Subagent finished.
 
 ### 11. `thinking_chunk` *(streaming)*
 
-Orchestrator's internal reasoning/chain-of-thought. Emitted by all providers that support thinking (Gemini thinking, OpenAI reasoning, Anthropic extended thinking). Frontend can show collapsed or in a debug panel.
+**Main orchestrator only** — internal reasoning/chain-of-thought. Emitted by all providers that support thinking (Gemini thinking, OpenAI reasoning, Anthropic extended thinking). Thinking from subagents, brief generation, and verification is intentionally filtered out. Frontend can show collapsed or in a debug panel.
 
 ```json
 {
@@ -385,6 +406,8 @@ Emitted when orchestrator calls `ask_user`. **Blocks execution** until frontend 
 
 Emitted when sandbox mode is enabled and the orchestrator needs to execute a tool on the frontend. **Blocks execution** until frontend responds via `POST /tool/respond`.
 
+Both the request and the response are persisted to Firestore as a `tool_requests` subcollection doc (see [Firestore Persistence](#firestore-persistence)).
+
 ```json
 {
   "request_id": "uuid-string",
@@ -416,6 +439,23 @@ Emitted when sandbox mode is enabled and the orchestrator needs to execute a too
   }
 }
 ```
+
+**Persisted format** (Firestore `tool_requests` doc):
+```json
+{
+  "items": [
+    {
+      "request_id": "uuid-string",
+      "tool": "execute_code",
+      "args": {"code": "print('hello')"},
+      "created_at": 1708012345.678,
+      "output": {"success": true, "data": {"stdout": "hello\n", "stderr": "", "artifacts": []}}
+    }
+  ]
+}
+```
+
+> `output` is `null` if the frontend never responded (timeout) or the run ended before response arrived.
 
 ---
 
@@ -540,6 +580,25 @@ EventSource("/run")
 10. result            → final payload, close stream
 ```
 
+## Typical Plan Mode Flow
+
+```
+EventSource("/run") with mode="plan"
+
+1. run_start          → store run_id, show loading
+2. plan_created?      → display brief + plan (only if no plan in request)
+3. brief              → display brief card
+4. rubric             → display rubric card
+5. subagent_start     → show subagent spinner with instruction
+6. subagent_chunk*    → stream subagent text
+7. subagent_end       → collapse/finalize subagent
+8. model_chunk*       → stream orchestrator reasoning
+9. verification       → show attempt result (PASS/FAIL)
+   (repeat 5-9 if FAIL)
+10. answer            → submitted answer
+11. result            → final payload, close stream
+```
+
 ## Blocking Events
 
 Two event types **block backend execution** and require frontend HTTP response:
@@ -550,3 +609,19 @@ Two event types **block backend execution** and require frontend HTTP response:
 | `tool_request` | `POST /tool/respond` | `request_id`, `session_id`, `result` |
 
 If not responded to within timeout (~300s for questions, ~30s for tools), backend returns a timeout error to the orchestrator.
+
+---
+
+## Firestore Persistence
+
+At the end of each run, accumulated events are saved to Firestore as category-based subcollection docs under the run document. Written via `save_event_categories(run_id, docs)`.
+
+| Doc key | Contents | When present |
+|---------|----------|--------------|
+| `briefs` | `{"items": [{index, instruction, content, angle}]}` | Always (orchestrator creates at least one brief) |
+| `subagents` | `{"items": [{id, instruction, content, purpose}]}` | When subagents were spawned |
+| `verification` | `{"items": [{attempt, answer, result, is_error}]}` | When verification ran |
+| `tool_requests` | `{"items": [{request_id, tool, args, created_at, output}]}` | Sandbox mode — each request + response pair |
+| `thinking` | `{"content": "..."}` | When orchestrator emitted thinking |
+| `plan` | `{"brief": "...", "plan": "..."}` | Plan mode without client-provided plan |
+| `answer` | `{"content": "..."}` | When answer was submitted. Explore mode: `content` is an array of takes, plus `set_level_gaps`. |

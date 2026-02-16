@@ -21,7 +21,7 @@ import {
   type ToolRequest,
   type FileSystemInterface,
 } from '@/lib/sandboxExecutor';
-import { saveSandboxRun } from '@/lib/firestore';
+import { saveSandboxRun, saveToolRequests, type ToolRequestPersistItem } from '@/lib/firestore';
 import { store } from '@/store';
 
 const API_BASE = 'http://localhost:8000';
@@ -54,7 +54,7 @@ interface PendingTool {
 
 export interface ActivityItem {
   id: string;
-  type: 'tool_call' | 'thinking' | 'message' | 'question' | 'answer' | 'subagent' | 'model_output' | 'verification';
+  type: 'tool_call' | 'thinking' | 'message' | 'question' | 'answer' | 'subagent' | 'model_output' | 'verification' | 'plan';
   tool?: string;
   args?: Record<string, unknown>;
   content?: string;
@@ -64,7 +64,7 @@ export interface ActivityItem {
   subagentId?: string;
   stdout?: string;
   stderr?: string;
-  response?: string;        // subagent response
+  response?: string;        // subagent response / plan text (for plan type)
   attempt?: number;         // verification attempt number
   isError?: boolean;        // verification error flag
   verificationResult?: string;  // verification result text
@@ -89,6 +89,9 @@ export function useSandboxExecution(fs: FileSystemInterface) {
   const executorRef = useRef<SandboxToolExecutor | null>(null);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingChunksRef = useRef<Map<string, string>>(new Map()); // key -> accumulated text
+  // Track tool requests for Firestore persistence (sandbox mode)
+  const sandboxRunIdRef = useRef<string | null>(null);
+  const toolRequestItemsRef = useRef<ToolRequestPersistItem[]>([]);
 
   // Initialize executor once
   useEffect(() => {
@@ -157,6 +160,17 @@ export function useSandboxExecution(fs: FileSystemInterface) {
           };
           return updated;
         });
+
+        // Persist tool output to Firestore incrementally
+        const items = toolRequestItemsRef.current;
+        const match = items.find(i => i.request_id === request.request_id);
+        if (match) {
+          match.output = { success: result.success, data: result.data ?? (result.error ? { error: result.error } : {}) };
+          const rid = sandboxRunIdRef.current;
+          if (rid) {
+            saveToolRequests(rid, [...items]).catch(console.error);
+          }
+        }
       },
     });
   }, [fs, sessionId]);
@@ -164,6 +178,8 @@ export function useSandboxExecution(fs: FileSystemInterface) {
   const reset = useCallback(() => {
     if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
     pendingChunksRef.current.clear();
+    sandboxRunIdRef.current = null;
+    toolRequestItemsRef.current = [];
     setStatus('idle');
     setActivity([]);
     setResult(null);
@@ -206,6 +222,19 @@ export function useSandboxExecution(fs: FileSystemInterface) {
         status: 'pending',
         requestId: toolRequest.request_id,
       });
+
+      // Track for Firestore persistence (output filled in onToolComplete)
+      toolRequestItemsRef.current.push({
+        request_id: toolRequest.request_id,
+        tool: toolRequest.tool,
+        args: toolRequest.args,
+        created_at: Date.now() / 1000,
+        output: null,
+      });
+      const rid = sandboxRunIdRef.current;
+      if (rid) {
+        saveToolRequests(rid, [...toolRequestItemsRef.current]).catch(console.error);
+      }
 
       // Execute in background - don't block
       executorRef.current?.handleToolRequest(toolRequest).catch(console.error);
@@ -506,8 +535,22 @@ export function useSandboxExecution(fs: FileSystemInterface) {
 
       // Handle run-specific events
       switch (eventType) {
-        case 'run_start':
-          setRunId(typedData.run_id as string);
+        case 'run_start': {
+          const rid = typedData.run_id as string;
+          setRunId(rid);
+          sandboxRunIdRef.current = rid;
+          toolRequestItemsRef.current = [];
+          break;
+        }
+
+        case 'plan_created':
+          // Plan mode auto-generated brief + plan
+          setBrief(typedData.brief as string);
+          addActivity({
+            type: 'plan',
+            content: typedData.brief as string,
+            response: typedData.plan as string,
+          });
           break;
 
         case 'brief_start':
@@ -546,6 +589,13 @@ export function useSandboxExecution(fs: FileSystemInterface) {
             content: typedData.content as string,
           });
           break;
+
+        case 'error': {
+          const message = typedData.message as string || 'Unknown error';
+          setError(message);
+          setStatus('error');
+          break;
+        }
 
         case 'result': {
           const taskResult = { task: typedData.task, answer: typedData.answer, rubric: typedData.rubric, run_id: typedData.run_id } as TaskResult;
@@ -701,9 +751,20 @@ export function useSandboxExecution(fs: FileSystemInterface) {
 
       // Handle iterate-specific events
       switch (eventType) {
-        case 'iterate_start':
-          setRunId(typedData.run_id as string);
+        case 'iterate_start': {
+          const rid = typedData.run_id as string;
+          setRunId(rid);
+          sandboxRunIdRef.current = rid;
+          toolRequestItemsRef.current = [];
           break;
+        }
+
+        case 'error': {
+          const message = typedData.message as string || 'Unknown error';
+          setError(message);
+          setStatus('error');
+          break;
+        }
 
         case 'iterate_result':
         case 'result': {

@@ -219,6 +219,15 @@ export function useTaskExecution() {
           break;
         }
 
+        case 'plan_created': {
+          // Plan mode auto-generated brief + plan (when no plan provided in request)
+          setBrief(typedData.brief as string);
+          const event = { type: 'plan_created', brief: typedData.brief, plan: typedData.plan } as SSEEvent;
+          setEvents(prev => [...prev, event]);
+          bufferEvent(event);
+          break;
+        }
+
         case 'brief_start': {
           const event = { type: 'brief_start', brief_index: typedData.brief_index, instruction: typedData.instruction } as SSEEvent;
           setEvents(prev => [...prev, event]);

@@ -155,6 +155,11 @@ export function DashboardPage() {
                     )}
                   </div>
                   <div className="flex items-center gap-3 shrink-0">
+                    {run.sandbox && (
+                      <span className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-violet-500/10 text-violet-600 dark:text-violet-400">
+                        Sandbox
+                      </span>
+                    )}
                     {run.mode && (
                       <span className="text-xs text-muted-foreground capitalize">
                         {run.mode}

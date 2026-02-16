@@ -23,6 +23,7 @@ import type {
   BriefStartEvent,
   BriefChunkEvent,
   BriefEvent,
+  PlanCreatedEvent,
   SubagentStartEvent,
   SubagentChunkEvent,
   VerificationEvent,
@@ -103,8 +104,29 @@ export async function saveRunRubric(runId: string, rubric: string) {
   await setDoc(ref, { rubric, updatedAt: serverTimestamp() }, { merge: true });
 }
 
+export async function saveRunPlan(runId: string, plan: { brief: string; plan: string }) {
+  const ref = doc(db, 'runs', runId);
+  await setDoc(ref, { plan, updatedAt: serverTimestamp() }, { merge: true });
+}
+
+// --- Tool request persistence (sandbox, incremental) ---
+
+export interface ToolRequestPersistItem {
+  request_id: string;
+  tool: string;
+  args: Record<string, unknown>;
+  created_at: number; // epoch seconds
+  output: { success: boolean; data: unknown } | null;
+}
+
+/** Write/overwrite the tool_requests doc for a sandbox run. Called incrementally as each tool completes. */
+export async function saveToolRequests(runId: string, items: ToolRequestPersistItem[]) {
+  const ref = doc(db, `runs/${runId}/events`, 'tool_requests');
+  await setDoc(ref, sanitize({ items, createdAt: serverTimestamp() }));
+}
+
 // --- Structured event docs (subcollection) ---
-// Written once when a run finishes. 5 named docs per run.
+// Written once when a run finishes. Named docs per run.
 
 export async function saveStructuredEvents(
   runId: string,
@@ -136,6 +158,16 @@ export async function saveStructuredEvents(
       } else {
         briefMap.set(idx, { index: idx, instruction: '', content: e.content, angle: e.angle });
       }
+    }
+  }
+
+  // --- Extract plan_created ---
+  let planDoc: { brief: string; plan: string } | null = null;
+  for (const event of events) {
+    if (event.type === 'plan_created') {
+      const e = event as PlanCreatedEvent;
+      planDoc = { brief: e.brief, plan: e.plan };
+      break; // Only one plan_created per run
     }
   }
 
@@ -193,6 +225,14 @@ export async function saveStructuredEvents(
 
   // --- Write docs in parallel (only if data exists) ---
   const writes: Promise<void>[] = [];
+
+  if (planDoc) {
+    writes.push(setDoc(doc(db, parentPath, 'plan'), {
+      brief: planDoc.brief,
+      plan: planDoc.plan,
+      createdAt: serverTimestamp(),
+    }));
+  }
 
   if (briefMap.size > 0) {
     writes.push(setDoc(doc(db, parentPath, 'briefs'), sanitize({
@@ -358,6 +398,7 @@ export async function fetchUserRuns(
         status: data.status,
         mode: data.mode,
         provider: data.provider,
+        sandbox: data.sandbox ?? false,
         createdAt: data.createdAt instanceof Timestamp ? data.createdAt.toDate().toISOString() : data.createdAt,
         updatedAt: data.updatedAt instanceof Timestamp ? data.updatedAt.toDate().toISOString() : data.updatedAt,
         result: data.result,
@@ -371,16 +412,24 @@ export function resetDashboardPagination() {
   lastDocSnapshot = null;
 }
 
-/** Reconstruct SSEEvent[] from the 5 named event docs. */
+/** Reconstruct SSEEvent[] from the named event docs. */
 function reconstructEvents(basePath: string, snaps: {
+  plan: ReturnType<typeof getDoc> extends Promise<infer T> ? T : never;
   briefs: ReturnType<typeof getDoc> extends Promise<infer T> ? T : never;
   subagents: ReturnType<typeof getDoc> extends Promise<infer T> ? T : never;
   verification: ReturnType<typeof getDoc> extends Promise<infer T> ? T : never;
   thinking: ReturnType<typeof getDoc> extends Promise<infer T> ? T : never;
   answer: ReturnType<typeof getDoc> extends Promise<infer T> ? T : never;
+  tool_requests: ReturnType<typeof getDoc> extends Promise<infer T> ? T : never;
 }): SSEEvent[] {
   void basePath; // unused, path already resolved in snaps
   const events: SSEEvent[] = [];
+
+  // Plan → plan_created event
+  if (snaps.plan.exists()) {
+    const planData = snaps.plan.data()!;
+    events.push({ type: 'plan_created', brief: planData.brief, plan: planData.plan } as SSEEvent);
+  }
 
   // Briefs → brief_start + brief per item
   if (snaps.briefs.exists()) {
@@ -425,18 +474,35 @@ function reconstructEvents(basePath: string, snaps: {
     // Array content (explore takes) is read directly by fetchRunWithEvents into result.takes
   }
 
+  // Tool requests → tool_request events (sandbox mode)
+  if (snaps.tool_requests.exists()) {
+    const items = snaps.tool_requests.data()!.items as ToolRequestPersistItem[];
+    for (const item of items) {
+      events.push({
+        type: 'tool_request',
+        request_id: item.request_id,
+        session_id: '',
+        tool: item.tool,
+        args: item.args,
+        timeout_ms: 30000,
+      } as SSEEvent);
+    }
+  }
+
   return events;
 }
 
 async function fetchEventDocs(basePath: string) {
-  const [briefs, subagents, verification, thinking, answer] = await Promise.all([
+  const [plan, briefs, subagents, verification, thinking, answer, tool_requests] = await Promise.all([
+    getDoc(doc(db, basePath, 'plan')),
     getDoc(doc(db, basePath, 'briefs')),
     getDoc(doc(db, basePath, 'subagents')),
     getDoc(doc(db, basePath, 'verification')),
     getDoc(doc(db, basePath, 'thinking')),
     getDoc(doc(db, basePath, 'answer')),
+    getDoc(doc(db, basePath, 'tool_requests')),
   ]);
-  return { briefs, subagents, verification, thinking, answer };
+  return { plan, briefs, subagents, verification, thinking, answer, tool_requests };
 }
 
 export async function fetchRunWithEvents(runId: string): Promise<RunData | null> {

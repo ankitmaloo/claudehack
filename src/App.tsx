@@ -231,6 +231,7 @@ function AppContent() {
   const [editedRubric, setEditedRubric] = useState<string | null>(null);
   const [currentTask, setCurrentTask] = useState<string>('');
   const [suggestedTask, setSuggestedTask] = useState<string>('');
+  const [suggestedMode, setSuggestedMode] = useState<'standard' | 'plan' | 'explore' | undefined>(undefined);
   const [currentMode, setCurrentMode] = useState<ExecutionMode>('standard');
   const [searchEnabled, setSearchEnabled] = useState(false);
   const [currentProvider, setCurrentProvider] = useState<Provider>('gemini');
@@ -1142,9 +1143,11 @@ function AppContent() {
                     onSubmit={(task, files, mode, enableSearch, provider) => {
                       handleSubmit(task, files, mode, enableSearch, provider);
                       setSuggestedTask('');
+                      setSuggestedMode(undefined);
                     }}
                     placeholder="What would you like to accomplish?"
                     initialTask={suggestedTask}
+                    initialMode={suggestedMode}
                   />
                   {demoMode && (
                     <p className="text-center text-xs text-muted-foreground mt-4">
@@ -1155,14 +1158,14 @@ function AppContent() {
                   {/* Example questions */}
                   <div className="mt-8 flex flex-wrap justify-center gap-2">
                     {[
-                      "Draft a competitive analysis of our top 3 competitors' pricing strategies and recommend where we're leaving money on the table",
-                      "Our NPS dropped 12 points this quarter. Analyze possible root causes and build an action plan to present to the board",
-                      "Write a memo: should we build or buy our data pipeline? Include cost modeling, team impact, and a 3-year projection",
-                      "Create a GTM launch brief for entering the mid-market segment — positioning, channels, first 90-day milestones",
+                      "Users keep requesting an API but we're a no-code product. What happens if we build one?",
+                      "Calendly is a feature, not a product — but it's worth $3B. Why hasn't anyone killed it?",
+                      "Superhuman charges $30/mo for email and it works. Could that model work for other productivity tools?",
+                      "How do you sell AI to a cost center head when any efficiency gains mean their budget shrinks?",
                     ].map((q) => (
                       <button
                         key={q}
-                        onClick={() => setSuggestedTask(q)}
+                        onClick={() => { setSuggestedTask(q); setSuggestedMode('explore'); }}
                         className="px-3 py-1.5 text-xs text-left text-muted-foreground hover:text-foreground bg-muted/40 hover:bg-muted/70 border border-border/40 hover:border-border/60 rounded-lg transition-colors leading-snug max-w-[17rem] cursor-pointer"
                       >
                         {q}

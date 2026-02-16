@@ -682,6 +682,42 @@ export function SandboxPage() {
       );
     }
 
+    // Plan (auto-generated brief + plan in plan mode)
+    if (item.type === 'plan') {
+      return (
+        <div key={item.id} className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 overflow-hidden">
+          <button
+            onClick={() => toggleExpanded(item.id)}
+            className="w-full flex items-center gap-2 px-2.5 py-2 text-left"
+          >
+            <MapIcon className="w-3.5 h-3.5 text-emerald-500 flex-shrink-0" />
+            <span className="text-xs font-medium text-emerald-700 dark:text-emerald-400 flex-1">Auto-generated Plan</span>
+            <ChevronRight className={cn("w-3 h-3 text-muted-foreground transition-transform flex-shrink-0", isExpanded && "rotate-90")} />
+          </button>
+          {isExpanded && (
+            <div className="border-t border-emerald-500/10">
+              {item.content && (
+                <div className="px-2.5 py-2 border-b border-emerald-500/10">
+                  <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide mb-1">Brief</p>
+                  <div className="prose prose-sm dark:prose-invert max-w-none text-xs">
+                    <Markdown>{item.content}</Markdown>
+                  </div>
+                </div>
+              )}
+              {item.response && (
+                <div className="px-2.5 py-2">
+                  <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide mb-1">Plan</p>
+                  <div className="prose prose-sm dark:prose-invert max-w-none text-xs">
+                    <Markdown>{item.response}</Markdown>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     // Question
     if (item.type === 'question') {
       return (
@@ -1247,6 +1283,7 @@ export function SandboxPage() {
                     item.type === 'verification' ? "bg-amber-500" :
                     item.type === 'model_output' ? "bg-muted-foreground" :
                     item.type === 'answer' ? "bg-green-500" :
+                    item.type === 'plan' ? "bg-emerald-500" :
                     "bg-muted-foreground"
                   )} />
                   <span className="text-muted-foreground truncate">
@@ -1256,6 +1293,7 @@ export function SandboxPage() {
                     {item.type === 'model_output' && 'Model output'}
                     {item.type === 'verification' && `Verification #${item.attempt ?? ''}`}
                     {item.type === 'answer' && 'Answer'}
+                    {item.type === 'plan' && 'Auto-generated Plan'}
                     {item.type === 'question' && 'Question'}
                   </span>
                 </div>

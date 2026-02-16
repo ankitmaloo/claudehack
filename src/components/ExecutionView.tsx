@@ -8,6 +8,7 @@ import {
   Loader2,
   FileText,
   AlertCircle,
+  Map as MapIcon,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -17,7 +18,7 @@ import {
 } from "@/components/ui/collapsible";
 import { Markdown } from "@/components/ui/markdown";
 import { cn } from "@/lib/utils";
-import type { SSEEvent, TaskStatus, SubagentStartEvent, SubagentChunkEvent, SubagentEndEvent, VerificationEvent, AnswerEvent, BriefEvent } from "@/types";
+import type { SSEEvent, TaskStatus, SubagentStartEvent, SubagentChunkEvent, SubagentEndEvent, VerificationEvent, AnswerEvent, BriefEvent, PlanCreatedEvent } from "@/types";
 
 interface ExecutionViewProps {
   events: SSEEvent[];
@@ -25,7 +26,7 @@ interface ExecutionViewProps {
 }
 
 // Step types based on new API event types
-type StepType = "brief" | "subagent" | "verification" | "answer";
+type StepType = "plan" | "brief" | "subagent" | "verification" | "answer";
 
 // Subagent pair: instruction + response
 interface SubagentPair {
@@ -41,6 +42,12 @@ interface BriefPair {
   content?: string;
 }
 
+// Plan data from plan_created event
+interface PlanData {
+  brief: string;
+  plan: string;
+}
+
 // Grouped step containing multiple events of the same type
 interface GroupedStep {
   id: string;
@@ -49,6 +56,7 @@ interface GroupedStep {
   events: Array<{ content: string; subagentId?: string; attempt?: number; isError?: boolean }>;
   subagentPairs?: SubagentPair[];
   briefPairs?: BriefPair[];
+  planData?: PlanData;
 }
 
 // Get content from event based on type
@@ -71,6 +79,8 @@ function getEventContent(event: SSEEvent): string {
 // Map event to step type
 function detectStepType(event: SSEEvent): StepType | null {
   switch (event.type) {
+    case 'plan_created':
+      return 'plan';
     case 'brief_start':
     case 'brief_chunk':
     case 'brief':
@@ -92,6 +102,8 @@ function detectStepType(event: SSEEvent): StepType | null {
 // Get label for step type
 function getStepLabel(type: StepType, count: number): string {
   switch (type) {
+    case "plan":
+      return "Execution Plan";
     case "brief":
       return count > 1 ? `Briefs (${count})` : "Brief";
     case "subagent":
@@ -134,6 +146,7 @@ function getStatusMessage(status: TaskStatus): string {
 
 // Step configuration with icons and colors
 const stepConfig: Record<StepType, { icon: typeof Bot; color: string }> = {
+  plan: { icon: MapIcon, color: "text-emerald-600" },
   brief: { icon: FileText, color: "text-blue-500" },
   subagent: { icon: Bot, color: "text-violet-500" },
   verification: { icon: AlertCircle, color: "text-amber-500" },
@@ -143,11 +156,15 @@ const stepConfig: Record<StepType, { icon: typeof Bot; color: string }> = {
 // Process events into grouped steps by type
 function processEventsToGroupedSteps(events: SSEEvent[]): GroupedStep[] {
   const groups: Record<StepType, GroupedStep['events']> = {
+    plan: [],
     brief: [],
     subagent: [],
     verification: [],
     answer: [],
   };
+
+  // Track plan_created data
+  let planData: PlanData | null = null;
 
   // Track subagent pairs by ID
   const subagentMap = new Map<string, SubagentPair>();
@@ -163,6 +180,13 @@ function processEventsToGroupedSteps(events: SSEEvent[]): GroupedStep[] {
   for (const event of events) {
     const stepType = detectStepType(event);
     if (!stepType) continue;
+
+    // plan_created: store auto-generated brief + plan
+    if (event.type === 'plan_created') {
+      const e = event as PlanCreatedEvent;
+      planData = { brief: e.brief, plan: e.plan };
+      continue;
+    }
 
     // brief_start: create pair with instruction
     if (event.type === 'brief_start') {
@@ -276,11 +300,19 @@ function processEventsToGroupedSteps(events: SSEEvent[]): GroupedStep[] {
   }
 
   // Convert to ordered array
-  const stepOrder: StepType[] = ["brief", "subagent", "verification", "answer"];
+  const stepOrder: StepType[] = ["plan", "brief", "subagent", "verification", "answer"];
   const result: GroupedStep[] = [];
 
   for (const type of stepOrder) {
-    if (type === 'brief' && briefMap.size > 0) {
+    if (type === 'plan' && planData) {
+      result.push({
+        id: type,
+        type,
+        label: getStepLabel(type, 1),
+        events: [],
+        planData,
+      });
+    } else if (type === 'brief' && briefMap.size > 0) {
       const briefPairs = Array.from(briefMap.values()).sort((a, b) => a.briefIndex - b.briefIndex);
       result.push({
         id: type,
@@ -445,6 +477,7 @@ function GroupedStepItem({ step, isOpen, onToggle }: GroupedStepItemProps) {
   const hasMultiple = step.events.length > 1;
   const isSubagentStep = step.type === 'subagent' && step.subagentPairs && step.subagentPairs.length > 0;
   const isBriefStep = step.type === 'brief' && step.briefPairs && step.briefPairs.length > 0;
+  const isPlanStep = step.type === 'plan' && step.planData;
 
   // Track which subagent outputs are expanded
   const [expandedOutputs, setExpandedOutputs] = useState<Set<string>>(new Set());
@@ -462,7 +495,9 @@ function GroupedStepItem({ step, isOpen, onToggle }: GroupedStepItemProps) {
   };
 
   // Preview shows first item's content, truncated
-  const previewContent = isSubagentStep
+  const previewContent = isPlanStep
+    ? step.planData!.plan.slice(0, 200)
+    : isSubagentStep
     ? step.subagentPairs![0]?.instruction || ""
     : isBriefStep
     ? step.briefPairs![0]?.instruction || step.briefPairs![0]?.content || ""
@@ -532,7 +567,26 @@ function GroupedStepItem({ step, isOpen, onToggle }: GroupedStepItemProps) {
         >
           <CardContent className="pt-0 pb-4 px-3">
             <div className="pl-7 border-l-2 border-border/40 ml-2">
-              {isBriefStep ? (
+              {isPlanStep ? (
+                <div className="space-y-4">
+                  <div className="rounded-lg border border-emerald-200/50 dark:border-emerald-800/30 bg-emerald-50/30 dark:bg-emerald-950/20 overflow-hidden">
+                    <div className="px-3 py-2 bg-emerald-100/50 dark:bg-emerald-900/30 border-b border-emerald-200/50 dark:border-emerald-800/30">
+                      <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Brief</span>
+                    </div>
+                    <div className="px-3 py-3 prose prose-sm dark:prose-invert max-w-none">
+                      <Markdown>{step.planData!.brief}</Markdown>
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-emerald-200/50 dark:border-emerald-800/30 bg-emerald-50/30 dark:bg-emerald-950/20 overflow-hidden">
+                    <div className="px-3 py-2 bg-emerald-100/50 dark:bg-emerald-900/30 border-b border-emerald-200/50 dark:border-emerald-800/30">
+                      <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Plan</span>
+                    </div>
+                    <div className="px-3 py-3 prose prose-sm dark:prose-invert max-w-none">
+                      <Markdown>{step.planData!.plan}</Markdown>
+                    </div>
+                  </div>
+                </div>
+              ) : isBriefStep ? (
                 <div className="space-y-3">
                   {step.briefPairs!.map((pair) => (
                     <BriefItem

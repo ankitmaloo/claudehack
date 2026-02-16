@@ -15,6 +15,7 @@ interface TaskInputProps {
   disabled?: boolean;
   placeholder?: string;
   initialTask?: string;
+  initialMode?: ExecutionMode;
 }
 
 const ACCEPTED_FILE_TYPES = ".pdf,.png,.jpg,.jpeg,.gif,.webp,.txt,.md,.csv,.json";
@@ -78,6 +79,7 @@ export function TaskInput({
   disabled = false,
   placeholder = "What would you like to accomplish?",
   initialTask,
+  initialMode,
 }: TaskInputProps) {
   const [task, setTask] = useState("");
   const [files, setFiles] = useState<AttachedFile[]>([]);
@@ -95,6 +97,13 @@ export function TaskInput({
       setTimeout(() => textareaRef.current?.focus(), 0);
     }
   }, [initialTask]);
+
+  // Set mode from external initialMode prop
+  useEffect(() => {
+    if (initialMode !== undefined) {
+      setMode(initialMode);
+    }
+  }, [initialMode]);
 
   // Auto-resize textarea
   useEffect(() => {

@@ -42,6 +42,7 @@ export interface DashboardRun {
   status: string;
   mode?: string;
   provider?: string;
+  sandbox?: boolean;
   createdAt: string;
   updatedAt: string;
   result: TaskResult | null;

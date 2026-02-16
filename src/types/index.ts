@@ -77,6 +77,7 @@ export interface IterateResult {
 //   everything else
 export type SSEEventType =
   | 'run_start'
+  | 'plan_created'
   | 'iterate_start'
   | 'resume_start'
   | 'brief_start'
@@ -106,6 +107,12 @@ export interface RunStartEvent {
   task: string;
   mode?: ExecutionMode;
   sandbox?: Record<string, unknown>;
+}
+
+export interface PlanCreatedEvent {
+  type: 'plan_created';
+  brief: string;   // Full brief markdown generated from the task
+  plan: string;    // Full execution plan markdown generated from the brief
 }
 
 export interface BriefStartEvent {
@@ -256,6 +263,7 @@ export interface ErrorEvent {
 // Union type for all SSE events
 export type SSEEvent =
   | RunStartEvent
+  | PlanCreatedEvent
   | BriefStartEvent
   | BriefChunkEvent
   | BriefEvent
