@@ -147,6 +147,18 @@ cd backend
 uv run uvicorn main:app --reload
 ```
 
+**API Keys (BYOK)**
+
+KW is bring-your-own-key. You can pass a provider API key from the frontend per-request (sent via `x-provider-key` header), or set defaults in `backend/.env`:
+
+```
+GEMINI_API_KEY=...
+OPENAI_API_KEY=...
+ANTHROPIC_API_KEY=...
+```
+
+If no key is provided, KW falls back to `gemini-3-flash-preview` as the default provider.
+
 ## Scripts
 
 | Command | Description |
