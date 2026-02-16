@@ -98,12 +98,17 @@ export function useTaskExecution() {
 
     abortControllerRef.current = new AbortController();
 
-    const userId = store.getState().auth.user?.uid;
+    const state = store.getState();
+    const userId = state.auth.user?.uid;
     if (!userId) {
       setError('User not authenticated');
       setStatus('error');
       return;
     }
+
+    // Resolve provider API key from Redux store
+    const provider = (body.provider as string) || 'gemini';
+    const providerKey = state.apiKeys[provider as keyof typeof state.apiKeys] ?? '';
 
     // Add user_id to the request body
     const requestBody = {
@@ -111,10 +116,17 @@ export function useTaskExecution() {
       user_id: userId,
     };
 
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (providerKey) {
+      headers['X-Provider-Key'] = providerKey;
+    }
+
     try {
       const response = await fetch(`${API_BASE}${endpoint}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(requestBody),
         signal: abortControllerRef.current.signal,
       });

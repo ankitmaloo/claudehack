@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Routes, Route, useNavigate, useParams, useLocation } from 'react-router-dom';
+import { Routes, Route, useNavigate, useParams, useLocation, Link } from 'react-router-dom';
 import { signOut } from 'firebase/auth';
 import { auth } from '@/lib/firebase';
 import { TaskInput } from '@/components/TaskInput';
@@ -14,6 +14,7 @@ import { UserQuestionDialog } from '@/components/UserQuestionDialog';
 import { AuthPage } from '@/components/AuthPage';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
 import { DashboardPage } from '@/components/DashboardPage';
+import { ProfilePage } from '@/components/ProfilePage';
 import { useTaskExecution } from '@/hooks/useTaskExecution';
 import { useAuth } from '@/context/AuthContext';
 import { useAppSelector, useAppDispatch } from '@/store';
@@ -43,6 +44,7 @@ import {
 } from '@/lib/mockData';
 import type { Attachment, AttachedFile, ExecutionMode, SSEEvent, TaskResult, TaskStatus, Checkpoint, BranchRef } from '@/types';
 import type { Provider } from '@/components/TaskInput';
+import { loadApiKeys, selectApiKeys, selectAvailableProviders, selectDefaultProvider, selectHasAnyApiKey } from '@/store/slices/apiKeysSlice';
 import { cn } from '@/lib/utils';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 
@@ -199,6 +201,15 @@ function AppContent() {
   const dispatch = useAppDispatch();
   const { user } = useAuth();
   const runs = useAppSelector((s) => s.runs.runs);
+  const apiKeys = useAppSelector(selectApiKeys);
+  const hasAnyApiKey = useAppSelector(selectHasAnyApiKey);
+  const availableProviders = useAppSelector(selectAvailableProviders);
+  const defaultProvider = useAppSelector(selectDefaultProvider);
+
+  // Hydrate API keys from localStorage on mount
+  useEffect(() => {
+    dispatch(loadApiKeys());
+  }, [dispatch]);
 
   const {
     status: realStatus,
@@ -235,6 +246,14 @@ function AppContent() {
   const [currentMode, setCurrentMode] = useState<ExecutionMode>('standard');
   const [searchEnabled, setSearchEnabled] = useState(false);
   const [currentProvider, setCurrentProvider] = useState<Provider>('gemini');
+
+  // Build headers with provider key for direct fetch calls
+  const providerHeaders = useCallback((provider?: string): Record<string, string> => {
+    const key = apiKeys[(provider || currentProvider) as keyof typeof apiKeys];
+    const h: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (key) h['X-Provider-Key'] = key;
+    return h;
+  }, [apiKeys, currentProvider]);
 
   // Version comparison state
   const [comparingVersionId, setComparingVersionId] = useState<string | null>(null);
@@ -711,7 +730,7 @@ function AppContent() {
 
         response = await fetch('http://localhost:8000/resume', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: providerHeaders(),
           body: JSON.stringify({
             session_id: streamSessionId,
             checkpoint_id: checkpointId,
@@ -737,7 +756,7 @@ function AppContent() {
 
         response = await fetch('http://localhost:8000/iterate', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: providerHeaders(),
           body: JSON.stringify({
             task: currentTask,
             answer: accumulatedOutput || result.answer,
@@ -807,7 +826,7 @@ function AppContent() {
       console.error('Branch from checkpoint failed:', err);
       setVersionStatus('error');
     }
-  }, [currentTask, result, demoMode, demoExecutionMode, showDemoState, streamRunId, streamSessionId, checkpointIds, searchEnabled, currentProvider, dispatch, user, runs]);
+  }, [currentTask, result, demoMode, demoExecutionMode, showDemoState, streamRunId, streamSessionId, checkpointIds, searchEnabled, currentProvider, providerHeaders, dispatch, user, runs]);
 
   // Get display data - respect primaryVersionId when a version is selected
   // Preferred version: a linked run ID (or null for original)
@@ -875,7 +894,7 @@ function AppContent() {
     try {
       const response = await fetch('http://localhost:8000/run', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: providerHeaders(),
         body: JSON.stringify({
           task: versionPrompt,
           user_id: userId,
@@ -935,7 +954,7 @@ function AppContent() {
       console.error('Version request failed:', err);
       setVersionStatus('error');
     }
-  }, [currentTask, streamRunId, demoMode, demoExecutionMode, showDemoState, searchEnabled, currentProvider, dispatch, user, runs]);
+  }, [currentTask, streamRunId, demoMode, demoExecutionMode, showDemoState, searchEnabled, currentProvider, providerHeaders, dispatch, user, runs]);
 
   // Prefer this version handler - sets which linked run is the preferred view
   const handlePreferVersion = useCallback((preferredRunId: string | null) => {
@@ -1111,9 +1130,12 @@ function AppContent() {
                 {/* Auth UI */}
                 {user && (
                   <div className="flex items-center gap-3">
-                    <span className="text-xs text-muted-foreground">
+                    <Link
+                      to="/profile"
+                      className="text-xs text-muted-foreground hover:text-foreground hover:underline transition-colors"
+                    >
                       {user.displayName || user.email}
-                    </span>
+                    </Link>
                     <button
                       onClick={() => signOut(auth)}
                       className="px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
@@ -1139,6 +1161,28 @@ function AppContent() {
             {!firestoreLoading && isIdle && (
               <div className="h-full flex items-center justify-center">
                 <div className="w-full max-w-2xl px-8">
+                  {/* Provider status label */}
+                  <div className="mb-3 text-center">
+                    {!hasAnyApiKey ? (
+                      <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400 text-xs">
+                        <span>No API key configured — please add one for this to work</span>
+                        <Link
+                          to="/profile"
+                          className="font-medium underline hover:text-amber-800 dark:hover:text-amber-300 transition-colors"
+                        >
+                          Add API Key
+                        </Link>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">
+                        Using <span className="font-medium text-foreground capitalize">{defaultProvider}</span>
+                        {availableProviders.length > 1 && (
+                          <> &middot; {availableProviders.length} providers configured</>
+                        )}
+                      </span>
+                    )}
+                  </div>
+
                   <TaskInput
                     onSubmit={(task, files, mode, enableSearch, provider) => {
                       handleSubmit(task, files, mode, enableSearch, provider);
@@ -1148,6 +1192,7 @@ function AppContent() {
                     placeholder="What would you like to accomplish?"
                     initialTask={suggestedTask}
                     initialMode={suggestedMode}
+                    availableProviders={availableProviders.length > 0 ? availableProviders : undefined}
                   />
                   {demoMode && (
                     <p className="text-center text-xs text-muted-foreground mt-4">
@@ -1336,6 +1381,11 @@ function App() {
       <Route path="/sandbox" element={
         <ProtectedRoute>
           <SandboxPage />
+        </ProtectedRoute>
+      } />
+      <Route path="/profile" element={
+        <ProtectedRoute>
+          <ProfilePage />
         </ProtectedRoute>
       } />
       <Route path="/dashboard" element={

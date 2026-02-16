@@ -49,6 +49,16 @@ function sanitize<T>(obj: T): T {
 
 // --- User document ---
 
+export interface UserProfile {
+  email: string | null;
+  displayName: string | null;
+  fullName: string | null;
+  title: string | null;
+  company: string | null;
+  bio: string | null;
+  lastLoginAt?: unknown;
+}
+
 export async function createUserDoc(uid: string, email: string | null, displayName: string | null) {
   const ref = doc(db, 'users', uid);
   // merge: true creates the doc if missing, or updates existing — works offline (queued)
@@ -57,6 +67,26 @@ export async function createUserDoc(uid: string, email: string | null, displayNa
     displayName,
     lastLoginAt: serverTimestamp(),
   }, { merge: true });
+}
+
+export async function fetchUserProfile(uid: string): Promise<UserProfile | null> {
+  const ref = doc(db, 'users', uid);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) return null;
+  const data = snap.data();
+  return {
+    email: data.email ?? null,
+    displayName: data.displayName ?? null,
+    fullName: data.fullName ?? null,
+    title: data.title ?? null,
+    company: data.company ?? null,
+    bio: data.bio ?? null,
+  };
+}
+
+export async function updateUserProfile(uid: string, fields: Partial<Omit<UserProfile, 'email' | 'lastLoginAt'>>) {
+  const ref = doc(db, 'users', uid);
+  await setDoc(ref, { ...sanitize(fields), updatedAt: serverTimestamp() }, { merge: true });
 }
 
 // --- Run documents ---

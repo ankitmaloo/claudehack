@@ -16,6 +16,7 @@ interface TaskInputProps {
   placeholder?: string;
   initialTask?: string;
   initialMode?: ExecutionMode;
+  availableProviders?: Provider[];
 }
 
 const ACCEPTED_FILE_TYPES = ".pdf,.png,.jpg,.jpeg,.gif,.webp,.txt,.md,.csv,.json";
@@ -74,18 +75,37 @@ async function fileToText(file: File): Promise<string> {
   });
 }
 
+const ALL_PROVIDERS: { value: Provider; label: string }[] = [
+  { value: 'gemini', label: 'Gemini' },
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'anthropic', label: 'Anthropic' },
+];
+
 export function TaskInput({
   onSubmit,
   disabled = false,
   placeholder = "What would you like to accomplish?",
   initialTask,
   initialMode,
+  availableProviders,
 }: TaskInputProps) {
   const [task, setTask] = useState("");
   const [files, setFiles] = useState<AttachedFile[]>([]);
   const [mode, setMode] = useState<ExecutionMode>('standard');
-  const [provider, setProvider] = useState<Provider>('gemini');
+  const [provider, setProvider] = useState<Provider>(availableProviders?.[0] ?? 'gemini');
   const [enableSearch, setEnableSearch] = useState(false);
+
+  // Filter providers to only those with keys configured (if provided)
+  const displayProviders = availableProviders
+    ? ALL_PROVIDERS.filter((p) => availableProviders.includes(p.value))
+    : ALL_PROVIDERS;
+
+  // Auto-select first available provider when availableProviders changes
+  useEffect(() => {
+    if (availableProviders && availableProviders.length > 0 && !availableProviders.includes(provider)) {
+      setProvider(availableProviders[0]);
+    }
+  }, [availableProviders]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -387,7 +407,7 @@ export function TaskInput({
             <select
               value={provider}
               onChange={(e) => setProvider(e.target.value as Provider)}
-              disabled={disabled}
+              disabled={disabled || displayProviders.length === 0}
               className={cn(
                 "h-7 px-2 text-xs font-medium rounded-md",
                 "bg-neutral-100 dark:bg-neutral-800 border-none",
@@ -396,9 +416,12 @@ export function TaskInput({
                 "cursor-pointer"
               )}
             >
-              <option value="gemini">Gemini</option>
-              <option value="openai">OpenAI</option>
-              <option value="anthropic">Anthropic</option>
+              {displayProviders.length === 0 && (
+                <option value="">No provider</option>
+              )}
+              {displayProviders.map((p) => (
+                <option key={p.value} value={p.value}>{p.label}</option>
+              ))}
             </select>
 
             <Button

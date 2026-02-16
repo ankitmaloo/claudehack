@@ -429,12 +429,18 @@ export function useSandboxExecution(fs: FileSystemInterface) {
 
     abortControllerRef.current = new AbortController();
 
-    const userId = store.getState().auth.user?.uid;
+    const appState = store.getState();
+    const userId = appState.auth.user?.uid;
     if (!userId) {
       setError('User not authenticated');
       setStatus('error');
       return;
     }
+
+    const provider = (request as Record<string, unknown>).provider as string || 'gemini';
+    const providerKey = appState.apiKeys[provider as keyof typeof appState.apiKeys] ?? '';
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (providerKey) headers['X-Provider-Key'] = providerKey;
 
     const sandboxRequest = {
       ...request,
@@ -447,7 +453,7 @@ export function useSandboxExecution(fs: FileSystemInterface) {
     try {
       const response = await fetch(`${API_BASE}/run`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(sandboxRequest),
         signal: abortControllerRef.current.signal,
       });
@@ -660,12 +666,18 @@ export function useSandboxExecution(fs: FileSystemInterface) {
 
     abortControllerRef.current = new AbortController();
 
-    const userId = store.getState().auth.user?.uid;
+    const iterState = store.getState();
+    const userId = iterState.auth.user?.uid;
     if (!userId) {
       setError('User not authenticated');
       setStatus('error');
       return;
     }
+
+    const iterProvider = (request as Record<string, unknown>).provider as string || 'gemini';
+    const iterProviderKey = iterState.apiKeys[iterProvider as keyof typeof iterState.apiKeys] ?? '';
+    const iterHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (iterProviderKey) iterHeaders['X-Provider-Key'] = iterProviderKey;
 
     const iterateRequest = {
       ...request,
@@ -678,7 +690,7 @@ export function useSandboxExecution(fs: FileSystemInterface) {
     try {
       const response = await fetch(`${API_BASE}/iterate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: iterHeaders,
         body: JSON.stringify(iterateRequest),
         signal: abortControllerRef.current.signal,
       });

@@ -54,6 +54,8 @@ import {
   Zap,
 } from 'lucide-react';
 import type { ExecutionMode, IterateRequest } from '@/types';
+import { useAppSelector } from '@/store';
+import { selectAvailableProviders, selectHasAnyApiKey } from '@/store/slices/apiKeysSlice';
 
 interface FileEntry {
   name: string;
@@ -203,11 +205,25 @@ export function SandboxPage() {
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string>>({});
   const [centerTab, setCenterTab] = useState<'activity' | 'files'>('activity');
 
+  // API key state
+  const availableProviders = useAppSelector(selectAvailableProviders);
+  const hasAnyApiKey = useAppSelector(selectHasAnyApiKey);
+  const displayProviders = availableProviders.length > 0
+    ? PROVIDER_OPTIONS.filter((p) => availableProviders.includes(p.value))
+    : PROVIDER_OPTIONS;
+
   // New: mode, provider, plan/explore settings
   const [mode, setMode] = useState<ExecutionMode>('standard');
-  const [provider, setProvider] = useState<Provider>('gemini');
+  const [provider, setProvider] = useState<Provider>(availableProviders[0] as Provider ?? 'gemini');
   const [planText, setPlanText] = useState('');
   const [numTakes, setNumTakes] = useState(3);
+
+  // Auto-select first available provider when keys change
+  useEffect(() => {
+    if (availableProviders.length > 0 && !availableProviders.includes(provider)) {
+      setProvider(availableProviders[0] as Provider);
+    }
+  }, [availableProviders]);
 
   // Save-as dialog state
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
@@ -855,6 +871,18 @@ export function SandboxPage() {
                   )}
                 </div>
 
+                {!hasAnyApiKey && (
+                  <div className="flex items-center justify-center gap-2 px-3 py-1.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400 text-xs">
+                    <span>No API key configured</span>
+                    <Link
+                      to="/profile"
+                      className="font-medium underline hover:text-amber-800 dark:hover:text-amber-300 transition-colors"
+                    >
+                      Add API Key
+                    </Link>
+                  </div>
+                )}
+
                 {(fs.hasProject || demoMode) && (
                   <>
                     {/* Task input with model dropdown */}
@@ -877,9 +905,13 @@ export function SandboxPage() {
                         <select
                           value={provider}
                           onChange={(e) => setProvider(e.target.value as Provider)}
+                          disabled={displayProviders.length === 0}
                           className="h-7 px-2 text-xs rounded-md border border-input bg-background text-muted-foreground hover:bg-muted/50 cursor-pointer focus:outline-none focus:ring-1 focus:ring-ring"
                         >
-                          {PROVIDER_OPTIONS.map(opt => (
+                          {displayProviders.length === 0 && (
+                            <option value="">No provider</option>
+                          )}
+                          {displayProviders.map(opt => (
                             <option key={opt.value} value={opt.value}>{opt.label}</option>
                           ))}
                         </select>
