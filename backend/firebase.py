@@ -21,6 +21,8 @@ def sanitize(obj):
     """Recursively strip None values (Firestore rejects them)."""
     if obj is None:
         return None
+    if obj is firestore.SERVER_TIMESTAMP:                                                                                                                    
+        return obj 
     if isinstance(obj, list):
         return [sanitize(item) for item in obj]
     if isinstance(obj, dict):

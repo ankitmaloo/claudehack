@@ -2,6 +2,8 @@
 
 A browser-native system for *knowledge work*—not "coding, but with longer prompts." Built for messy, ambiguous tasks where the hard part is framing, tradeoffs, and verification, not compiling.
 
+KW uses [kw-sdk](https://github.com/ClioAI/kw-sdk) as its orchestration harness—the engine that handles brief generation, hidden-rubric verification, subagent coordination, and the mode system. Everything else in this repo (the server, frontend, browser sandbox, file system layer, streaming infrastructure) is built around that core.
+
 ## Why this exists
 
 Most AI tools treat knowledge work like code: one input, one output, done. But real knowledge work—strategy memos, policy analysis, vendor evaluations, research briefs—has no compiler. The hard part isn't generating text. It's figuring out what the right question is, what you're trading off, and whether you actually addressed the thing you set out to address.
@@ -54,6 +56,41 @@ This "gap-finding" step is often the most valuable output. It tells you what you
 
 **Why this matters:** For ambiguous, high-stakes problems, the shape of the solution space matters more than any single answer. Explore mode gives you a map instead of a pin.
 
+## How the Server Manages the SDK
+
+The kw-sdk is a synchronous Python library — it runs a blocking orchestration loop (provider calls, tool calls, verification) and emits `HistoryEntry` events as it goes. The server (`main.py`) is the layer that turns that into a real-time, multi-session, sandbox-aware application. Here's how it works:
+
+### Streaming bridge
+
+The SDK emits structured `HistoryEntry` objects (tool calls, tool responses, brief chunks, subagent output, verification results). The server registers an `on_event` callback that pushes every entry into an `asyncio.Queue`, then runs the SDK's blocking `run_single()` in a thread pool. The main async generator drains that queue in real-time, converting entries into SSE events the frontend consumes.
+
+This is two queues, not one — there's a second `sse_queue` specifically for sandbox tool requests that the `RemoteExecutor` emits. The stream loop interleaves both: SDK events from the first queue, sandbox delegation events from the second, yielded as SSE in arrival order.
+
+### Event filtering
+
+The raw SDK history is verbose and internal. The `EventFilter` sits between the queue and the SSE stream, translating `HistoryEntry` types into UI-relevant events. It matches tool calls to their responses (tracking pending calls by name), counts verification attempts, infers subagent purpose in explore mode (take vs. counterfactual vs. set-level gaps), and drops anything the frontend doesn't need. The SDK doesn't know about the UI; the filter is what makes the stream legible.
+
+### Sandbox delegation
+
+When `sandbox_mode` is enabled, the server creates a `RemoteExecutor` instead of a `SubprocessExecutor`. The SDK doesn't know the difference — it calls `execute_code()` or `bash()` on whatever executor it's given. But the `RemoteExecutor` doesn't run anything locally. Instead it:
+
+1. Emits a `tool_request` event into the SSE stream (with a unique request ID)
+2. Blocks its thread, waiting on an `asyncio.Event`
+3. The frontend picks up the request, executes it in the browser sandbox (OPFS-staged file system, isolated JS scope), and POSTs the result back to `/tool/respond`
+4. The server resolves the waiting event, the SDK thread unblocks, and execution continues
+
+This is what makes browser-native execution possible. The SDK thinks it's running code locally. The server is silently proxying tool calls across the network to a sandboxed browser runtime and back — without the SDK needing any modification.
+
+### Session management
+
+Each `/run` call creates a fresh `RLHarness` instance with its own provider, executor, and config. But sessions outlive individual requests when checkpointing is enabled. The server holds onto the harness (with its full snapshot history) in an in-memory `session_store`, so `/resume` can restore from any checkpoint — rewire the logging callback to a new queue, and continue the orchestration loop from where it left off. A background task garbage-collects sessions after an hour.
+
+The server also maintains parallel registries for sandbox sessions (`sandbox_sessions`), provider sessions (`provider_sessions`), and event accumulators (`accumulator_sessions`), all keyed by session ID. This is what lets the `/tool/respond` and `/question/respond` endpoints find the right executor or provider to unblock when the frontend sends a response.
+
+### Persistence
+
+Every SSE event passes through an `EventAccumulator` that collects structured data — briefs, subagent outputs, verification results, tool requests with their responses, thinking traces. When the stream ends (or the client disconnects), the accumulator flushes everything to Firestore as categorized subcollection documents. The result itself is saved separately via a `done_callback` on the executor future, so it persists even if the SSE connection drops mid-stream. All Firestore writes are fire-and-forget on a dedicated thread pool to avoid blocking the event stream.
+
 ## Browser Sandbox
 
 All modes can run against a real workspace in the browser. KW uses the File System Access API to open a local folder, then stages all AI modifications in the browser's Origin Private File System (OPFS)—a private, sandboxed layer that never touches your actual files until you explicitly commit.
@@ -80,6 +117,7 @@ Your Files (read-only) → OPFS Staging (AI writes here) → You Review → Comm
 
 ## Tech Stack
 
+**Frontend**
 - React 19 + TypeScript
 - Vite
 - Tailwind CSS v4
@@ -88,18 +126,32 @@ Your Files (read-only) → OPFS Staging (AI writes here) → You Review → Comm
 - Firebase
 - Web Workers (via Comlink)
 
+**Backend**
+- Python 3.11+
+- FastAPI + Uvicorn
+- [kw-sdk](https://github.com/ClioAI/kw-sdk) for orchestration
+- Multi-provider support (Gemini, OpenAI, Anthropic)
+- Firebase Admin SDK for persistence
+
 ## Getting Started
 
+**Frontend**
 ```bash
 npm install
 npm run dev
+```
+
+**Backend**
+```bash
+cd backend
+uv run uvicorn main:app --reload
 ```
 
 ## Scripts
 
 | Command | Description |
 |---------|-------------|
-| `npm run dev` | Start dev server |
+| `npm run dev` | Start frontend dev server |
 | `npm run build` | Type-check and build for production |
 | `npm run preview` | Preview production build |
 | `npm run lint` | Run ESLint |
