@@ -19,6 +19,13 @@ dist-ssr/
 .stylelintcache
 *.tsbuildinfo
 
+# Credentials
+creds/
+
+# Python
+__pycache__/
+*.py[cod]
+
 # Environment files
 .env
 .env.local
