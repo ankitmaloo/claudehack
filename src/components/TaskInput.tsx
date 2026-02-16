@@ -5,7 +5,7 @@ import { useRef, useState, useCallback, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
-import { Paperclip, X, FileText, Image, File, ArrowRight } from "lucide-react";
+import { Paperclip, X, FileText, Image, File, ArrowRight, Zap, Map as MapIcon, Compass } from "lucide-react";
 import type { AttachedFile, ExecutionMode } from "@/types";
 
 export type Provider = 'gemini' | 'openai' | 'anthropic';
@@ -74,6 +74,12 @@ async function fileToText(file: File): Promise<string> {
     reader.readAsText(file);
   });
 }
+
+const MODE_OPTIONS: { value: ExecutionMode; label: string; icon: React.ElementType; desc: string }[] = [
+  { value: 'standard', label: 'Standard', icon: Zap, desc: 'Auto brief + rubric' },
+  { value: 'plan', label: 'Plan', icon: MapIcon, desc: 'Provide execution plan' },
+  { value: 'explore', label: 'Explore', icon: Compass, desc: 'Multiple takes' },
+];
 
 const ALL_PROVIDERS: { value: Provider; label: string }[] = [
   { value: 'gemini', label: 'Gemini' },
@@ -364,23 +370,10 @@ export function TaskInput({
               <Paperclip className="w-4 h-4" />
             </Button>
 
-            {/* Mode dropdown */}
-            <select
-              value={mode}
-              onChange={(e) => setMode(e.target.value as ExecutionMode)}
-              disabled={disabled}
-              className={cn(
-                "h-7 px-2 text-xs font-medium rounded-md",
-                "bg-neutral-100 dark:bg-neutral-800 border-none",
-                "text-neutral-700 dark:text-neutral-300",
-                "focus:outline-none focus:ring-1 focus:ring-neutral-300 dark:focus:ring-neutral-600",
-                "cursor-pointer"
-              )}
-            >
-              <option value="standard">Standard</option>
-              <option value="plan">Plan</option>
-              <option value="explore">Explore</option>
-            </select>
+            {/* Mode indicator */}
+            <span className="text-xs font-medium text-neutral-500 dark:text-neutral-400 capitalize">
+              {mode}
+            </span>
 
             <div className="flex items-center gap-2">
               <Switch
@@ -442,6 +435,32 @@ export function TaskInput({
             </Button>
           </div>
         </div>
+      </div>
+
+      {/* Mode selector cards */}
+      <div className="mt-3 flex gap-2">
+        {MODE_OPTIONS.map(opt => {
+          const Icon = opt.icon;
+          return (
+            <button
+              key={opt.value}
+              onClick={() => setMode(opt.value)}
+              disabled={disabled}
+              className={cn(
+                "flex-1 flex items-center gap-2 px-3 py-2 rounded-lg border text-left transition-all text-sm",
+                mode === opt.value
+                  ? "border-primary bg-primary/5 text-foreground"
+                  : "border-input bg-background text-muted-foreground hover:bg-muted/50"
+              )}
+            >
+              <Icon className="w-4 h-4 flex-shrink-0" />
+              <div>
+                <div className="font-medium text-xs">{opt.label}</div>
+                <div className="text-[10px] text-muted-foreground">{opt.desc}</div>
+              </div>
+            </button>
+          );
+        })}
       </div>
 
       {/* Helper text */}
