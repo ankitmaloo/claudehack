@@ -44,6 +44,7 @@ import {
 import type { Attachment, AttachedFile, ExecutionMode, SSEEvent, TaskResult, TaskStatus, Checkpoint, BranchRef } from '@/types';
 import type { Provider } from '@/components/TaskInput';
 import { cn } from '@/lib/utils';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 
 // Demo state type
 type DemoState = 'idle' | 'input' | 'planning' | 'executing' | 'completed';
@@ -229,6 +230,7 @@ function AppContent() {
   const [rubricPanelOpen, setRubricPanelOpen] = useState(false);
   const [editedRubric, setEditedRubric] = useState<string | null>(null);
   const [currentTask, setCurrentTask] = useState<string>('');
+  const [suggestedTask, setSuggestedTask] = useState<string>('');
   const [currentMode, setCurrentMode] = useState<ExecutionMode>('standard');
   const [searchEnabled, setSearchEnabled] = useState(false);
   const [currentProvider, setCurrentProvider] = useState<Provider>('gemini');
@@ -1030,6 +1032,22 @@ function AppContent() {
                   Dashboard
                 </button>
 
+                {/* Workspace link */}
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      onClick={() => navigate('/sandbox')}
+                      className="workspace-btn px-2.5 py-0.5 text-xs rounded-md bg-amber-50 dark:bg-amber-950 text-amber-800 dark:text-amber-200 hover:bg-amber-100 dark:hover:bg-amber-900 cursor-pointer transition-colors inline-flex items-center gap-1.5"
+                    >
+                      <span className="font-medium">Workspace</span>
+                      <span className="text-amber-500 dark:text-amber-400 text-[10px] leading-none">Work with your files</span>
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">
+                    Open your files and let AI edit, create, and run code in the browser
+                  </TooltipContent>
+                </Tooltip>
+
                 {/* Show current URL for debugging */}
                 {urlRunId && (
                   <span className="text-xs text-muted-foreground font-mono">
@@ -1121,14 +1139,36 @@ function AppContent() {
               <div className="h-full flex items-center justify-center">
                 <div className="w-full max-w-2xl px-8">
                   <TaskInput
-                    onSubmit={handleSubmit}
+                    onSubmit={(task, files, mode, enableSearch, provider) => {
+                      handleSubmit(task, files, mode, enableSearch, provider);
+                      setSuggestedTask('');
+                    }}
                     placeholder="What would you like to accomplish?"
+                    initialTask={suggestedTask}
                   />
                   {demoMode && (
                     <p className="text-center text-xs text-muted-foreground mt-4">
                       Try submitting a task, or use the demo buttons above to preview each state
                     </p>
                   )}
+
+                  {/* Example questions */}
+                  <div className="mt-8 flex flex-wrap justify-center gap-2">
+                    {[
+                      "Draft a competitive analysis of our top 3 competitors' pricing strategies and recommend where we're leaving money on the table",
+                      "Our NPS dropped 12 points this quarter. Analyze possible root causes and build an action plan to present to the board",
+                      "Write a memo: should we build or buy our data pipeline? Include cost modeling, team impact, and a 3-year projection",
+                      "Create a GTM launch brief for entering the mid-market segment — positioning, channels, first 90-day milestones",
+                    ].map((q) => (
+                      <button
+                        key={q}
+                        onClick={() => setSuggestedTask(q)}
+                        className="px-3 py-1.5 text-xs text-left text-muted-foreground hover:text-foreground bg-muted/40 hover:bg-muted/70 border border-border/40 hover:border-border/60 rounded-lg transition-colors leading-snug max-w-[17rem] cursor-pointer"
+                      >
+                        {q}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             )}

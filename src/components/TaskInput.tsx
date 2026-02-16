@@ -14,6 +14,7 @@ interface TaskInputProps {
   onSubmit: (task: string, files: AttachedFile[], mode: ExecutionMode, enableSearch: boolean, provider: Provider) => void;
   disabled?: boolean;
   placeholder?: string;
+  initialTask?: string;
 }
 
 const ACCEPTED_FILE_TYPES = ".pdf,.png,.jpg,.jpeg,.gif,.webp,.txt,.md,.csv,.json";
@@ -76,6 +77,7 @@ export function TaskInput({
   onSubmit,
   disabled = false,
   placeholder = "What would you like to accomplish?",
+  initialTask,
 }: TaskInputProps) {
   const [task, setTask] = useState("");
   const [files, setFiles] = useState<AttachedFile[]>([]);
@@ -84,6 +86,15 @@ export function TaskInput({
   const [enableSearch, setEnableSearch] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Set task from external initialTask prop
+  useEffect(() => {
+    if (initialTask !== undefined && initialTask !== "") {
+      setTask(initialTask);
+      // Focus the textarea after setting
+      setTimeout(() => textareaRef.current?.focus(), 0);
+    }
+  }, [initialTask]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -210,12 +221,12 @@ export function TaskInput({
     <div className="w-full max-w-2xl mx-auto">
       <div
         className={cn(
-          "relative rounded-xl border border-neutral-200 dark:border-neutral-800",
-          "bg-white dark:bg-neutral-950",
+          "workspace-btn relative rounded-xl",
           "shadow-sm transition-shadow duration-200",
-          "focus-within:shadow-md focus-within:border-neutral-300 dark:focus-within:border-neutral-700",
+          "focus-within:shadow-md",
           disabled && "opacity-60 cursor-not-allowed"
         )}
+        style={{ '--workspace-bg': '#ffffff', '--workspace-bg-dark': '#0a0a0a' } as React.CSSProperties}
       >
         {/* Hidden file input */}
         <input

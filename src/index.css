@@ -152,6 +152,53 @@
   font-family: var(--font-sans);
 }
 
+/* Orbiting border shine — single light rotating around the perimeter */
+@property --border-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes border-orbit {
+  to { --border-angle: 360deg; }
+}
+
+.workspace-btn {
+  position: relative;
+  border: 1.5px solid transparent;
+  background:
+    padding-box,
+    border-box;
+  background-image:
+    /* inner fill — matches the element bg set via utility classes */
+    linear-gradient(var(--workspace-bg, #fffbeb), var(--workspace-bg, #fffbeb)),
+    /* the orbiting shine */
+    conic-gradient(
+      from var(--border-angle),
+      #e5e5e5 0%,
+      #e5e5e5 70%,
+      #f59e0b 80%,
+      #fbbf24 85%,
+      #f59e0b 90%,
+      #e5e5e5 100%
+    );
+  animation: border-orbit 3.5s linear infinite;
+}
+
+:is(.dark) .workspace-btn {
+  background-image:
+    linear-gradient(var(--workspace-bg-dark, #451a03), var(--workspace-bg-dark, #451a03)),
+    conic-gradient(
+      from var(--border-angle),
+      #404040 0%,
+      #404040 70%,
+      #f59e0b 80%,
+      #fbbf24 85%,
+      #f59e0b 90%,
+      #404040 100%
+    );
+}
+
 /* Subtle paper texture overlay */
 .paper-texture {
   position: relative;
