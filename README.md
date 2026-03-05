@@ -135,6 +135,39 @@ Your Files (read-only) → OPFS Staging (AI writes here) → You Review → Comm
 
 ## Getting Started
 
+### 1. Firebase Setup
+
+KW uses Firebase for auth (frontend) and Firestore for persistence (both frontend and backend). You'll need a Firebase project with a **Firestore database named `ckwh`**.
+
+#### Create the Firestore database
+
+In the Firebase Console, go to **Firestore Database** and create a database with the database ID `ckwh`. The default `(default)` database will not work—it must be named `ckwh`.
+
+#### Frontend — `.env`
+
+Copy `.env.example` to `.env` and fill in your Firebase project config (found in Firebase Console → Project Settings → General → Your Apps → Web app):
+
+```
+VITE_FIREBASE_API_KEY=...
+VITE_FIREBASE_AUTH_DOMAIN=...
+VITE_FIREBASE_PROJECT_ID=...
+VITE_FIREBASE_STORAGE_BUCKET=...
+VITE_FIREBASE_MESSAGING_SENDER_ID=...
+VITE_FIREBASE_APP_ID=...
+```
+
+#### Backend — Service Account
+
+The backend uses the Firebase Admin SDK and requires a service account key file.
+
+1. In the Firebase Console, go to **Project Settings → Service Accounts**
+2. Click **Generate new private key** — this downloads a JSON file
+3. Place it at `backend/creds/cliokwh-firebase.json`
+
+The backend reads this file at startup (`backend/firebase.py`) to authenticate with Firestore.
+
+### 2. Install & Run
+
 **Frontend**
 ```bash
 npm install
@@ -147,7 +180,7 @@ cd backend
 uv run uvicorn main:app --reload
 ```
 
-**API Keys (BYOK)**
+### 3. API Keys (BYOK)
 
 KW is bring-your-own-key. You can pass a provider API key from the frontend per-request (sent via `x-provider-key` header), or set defaults in `backend/.env`:
 
