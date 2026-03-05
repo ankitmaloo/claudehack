@@ -1,11 +1,14 @@
 import asyncio
 import json
+import os
 import re
+import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,10 +16,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from firebase import save_run_doc, save_event_categories
-from verif.harness import RLHarness, RunResult, IterateResult, Attachment, Prompt, ProviderConfig
+from verif.harness import AsyncRLHarness, RunResult, IterateResult, Attachment, Prompt, ProviderConfig
 from verif.prompts import BRIEF_CREATOR, PLAN_CREATOR
 from verif.executor import SubprocessExecutor, RemoteExecutor
 from verif.providers.base import HistoryEntry
+from verif.skills import parse_skills
 
 
 @dataclass
@@ -87,6 +91,9 @@ class EventFilter:
                 "context": entry.metadata.get("context", ""),
                 "content": entry.content,
             })
+        elif entry.entry_type == "agent_notify":
+            level = entry.metadata.get("level", "info") if entry.metadata else "info"
+            return UIEvent("agent_notify", {"message": entry.content, "level": level})
         return None
 
     def _parse_tool_call(self, content: str) -> tuple[str, dict]:
@@ -110,8 +117,20 @@ class EventFilter:
         name, args = self._parse_tool_call(content)
         if not name:
             return None
-        # Store for matching with tool_response; subagent_start emitted from provider event
         self.pending_calls.append((name, args))
+        # Emit bg_agent_start for background delegate or build_skill
+        if name == "delegate" and args.get("background"):
+            return UIEvent("bg_agent_start", {
+                "prompt": args.get("prompt", "")[:300],
+                "tools": args.get("tools"),
+                "skill": args.get("skill"),
+            })
+        if name == "build_skill":
+            return UIEvent("bg_agent_start", {
+                "prompt": f"build_skill:{args.get('name', '')}",
+                "tools": ["execute_code", "search_web"],
+                "skill": args.get("name"),
+            })
         return None
 
     def _handle_tool_response(self, content: str, is_error: bool) -> UIEvent | None:
@@ -155,11 +174,26 @@ class EventFilter:
         elif name == "submit_answer":
             return UIEvent("answer", {"content": args.get("answer", "")})
 
+        elif name.startswith("background_"):
+            agent_id = name.removeprefix("background_")
+            return UIEvent("bg_agent_complete", {
+                "agent_id": agent_id,
+                "result": result[:1000],
+                "is_error": is_error,
+            })
+
         return None
 
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(_cleanup_sessions())
+    yield
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -168,28 +202,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-executor = ThreadPoolExecutor(max_workers=4)
-_fs_executor = ThreadPoolExecutor(max_workers=2)  # Dedicated pool for Firestore writes
+def _fs_fire(coro):
+    """Fire-and-forget async Firestore write with error logging."""
+    async def _safe():
+        try:
+            await coro
+        except Exception as e:
+            import traceback
+            print(f"Firestore error: {e}\n{traceback.format_exc()}")
+    asyncio.create_task(_safe())
 
 
-def _fs_call(fn, *args, **kwargs):
-    """Fire-and-forget wrapper with error logging."""
-    try:
-        fn(*args, **kwargs)
-    except Exception as e:
-        import traceback
-        print(f"Firestore error: {e}\n{traceback.format_exc()}")
+def fs_doc(**kwargs):
+    """Fire-and-forget run doc write."""
+    _fs_fire(save_run_doc(**kwargs))
 
 
-def fs_doc(loop: asyncio.AbstractEventLoop, **kwargs):
-    """Schedule a non-blocking run doc write."""
-    loop.run_in_executor(_fs_executor, lambda: _fs_call(save_run_doc, **kwargs))
-
-
-def fs_categories(loop: asyncio.AbstractEventLoop, run_id: str, categories: dict[str, dict]):
-    """Schedule a non-blocking category doc flush."""
+def fs_categories(run_id: str, categories: dict[str, dict]):
+    """Fire-and-forget category doc flush."""
     if categories:
-        loop.run_in_executor(_fs_executor, lambda: _fs_call(save_event_categories, run_id, categories))
+        _fs_fire(save_event_categories(run_id, categories))
 
 
 class EventAccumulator:
@@ -206,6 +238,8 @@ class EventAccumulator:
         self.answer: str | None = None
         self.plan: dict | None = None
         self._pending_brief_instruction: str = ""
+        self.bg_agents: list[dict] = []
+        self.notifications: list[dict] = []
 
     def process(self, ev: UIEvent):
         e, d = ev.event, ev.data
@@ -252,6 +286,17 @@ class EventAccumulator:
             })
         elif e == "plan_created":
             self.plan = {"brief": d.get("brief", ""), "plan": d.get("plan", "")}
+        elif e == "bg_agent_start":
+            self.bg_agents.append({"prompt": d.get("prompt", ""), "skill": d.get("skill"), "result": None})
+        elif e == "bg_agent_complete":
+            # Match to last unfinished bg_agent entry
+            for ba in reversed(self.bg_agents):
+                if ba["result"] is None:
+                    ba["result"] = d.get("result", "")
+                    ba["is_error"] = d.get("is_error", False)
+                    break
+        elif e == "agent_notify":
+            self.notifications.append({"message": d.get("message", ""), "level": d.get("level", "info")})
         elif e == "answer":
             self.answer = d.get("content", "")
 
@@ -276,6 +321,10 @@ class EventAccumulator:
             docs["tool_requests"] = {"items": self.tool_requests}
         if self.thinking:
             docs["thinking"] = {"content": self.thinking}
+        if self.bg_agents:
+            docs["bg_agents"] = {"items": self.bg_agents}
+        if self.notifications:
+            docs["notifications"] = {"items": self.notifications}
         if self.plan:
             docs["plan"] = self.plan
         if self.answer is not None:
@@ -304,7 +353,9 @@ class RunRequest(BaseModel):
     enable_search: bool = False
     enable_bash: bool = False  # Filesystem navigation
     enable_code: bool = False  # Python code execution
+    enable_ask_user: bool = False  # Allow orchestrator to ask user questions
     artifacts_dir: str = "./artifacts"  # Directory for code artifacts
+    skills_dir: Optional[str] = None  # Directory containing reusable skills
     max_iterations: int = 30
     mode: str = "standard"  # "standard" | "plan" | "explore"
     plan: Optional[str] = None  # User-provided execution plan
@@ -335,6 +386,7 @@ class IterateRequest(BaseModel):
     enable_search: bool = False
     enable_bash: bool = False
     enable_code: bool = False
+    enable_ask_user: bool = False
     artifacts_dir: str = "./artifacts"
     max_iterations: int = 30
     checkpoint: bool = False
@@ -359,7 +411,7 @@ accumulator_sessions: dict[str, EventAccumulator] = {}  # session_id -> accumula
 
 @dataclass
 class Session:
-    harness: RLHarness
+    harness: AsyncRLHarness
     run_ids: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
@@ -370,12 +422,41 @@ session_store: dict[str, Session] = {}
 SESSION_TTL = 3600  # 1 hour
 
 
+# Shared HTTP client pools — one per provider type, lazily initialized using env var keys
+_shared_client_pools: dict[str, dict[str, Any]] = {}
+
+
+def _get_shared_clients(provider: str) -> dict[str, Any]:
+    """Get or create shared clients for a provider type (env var keys only)."""
+    if provider not in _shared_client_pools:
+        if provider == "gemini":
+            from google import genai
+            _shared_client_pools[provider] = {
+                "client": genai.Client(api_key=os.environ.get("GEMINI_API_KEY")),
+            }
+        elif provider == "openai":
+            from openai import OpenAI, AsyncOpenAI
+            _shared_client_pools[provider] = {
+                "client": OpenAI(api_key=os.environ.get("OPENAI_API_KEY")),
+                "async_client": AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY")),
+            }
+        elif provider == "anthropic":
+            import anthropic
+            _shared_client_pools[provider] = {
+                "client": anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY")),
+                "async_client": anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY")),
+            }
+    return _shared_client_pools.get(provider, {})
+
+
 def _build_provider_config(provider: str, thinking_level: str, api_key: str | None = None) -> ProviderConfig:
+    # Custom API key → fresh clients (no shared pool contamination)
+    shared = None if api_key else _get_shared_clients(provider)
     if provider == "openai":
-        return ProviderConfig(name="openai", reasoning_effort=thinking_level, api_key=api_key)
+        return ProviderConfig(name="openai", reasoning_effort=thinking_level, api_key=api_key, shared_clients=shared)
     elif provider == "anthropic":
-        return ProviderConfig(name="anthropic", api_key=api_key)
-    return ProviderConfig(name="gemini", thinking_level=thinking_level.upper(), api_key=api_key)
+        return ProviderConfig(name="anthropic", api_key=api_key, shared_clients=shared)
+    return ProviderConfig(name="gemini", thinking_level=thinking_level.upper(), api_key=api_key, shared_clients=shared)
 
 
 class ToolResponseRequest(BaseModel):
@@ -390,14 +471,27 @@ class QuestionResponseRequest(BaseModel):
     answers: dict  # {question_index: answer_text}
 
 
-def _create_plan(provider, task: str, enable_search: bool = False) -> tuple[str, str]:
+async def _create_plan(provider, task: str, enable_search: bool = False) -> tuple[str, str]:
     """Generate brief + plan from task using provider."""
-    brief = provider.generate(task, system=BRIEF_CREATOR, enable_search=enable_search, _log=False)
-    plan = provider.generate(
+    brief = await provider.generate_async(task, system=BRIEF_CREATOR, enable_search=enable_search, _log=False)
+    plan = await provider.generate_async(
         f"Task: {task}\n\nBrief:\n{brief}", system=PLAN_CREATOR,
         enable_search=enable_search, _log=False,
     )
     return brief, plan
+
+
+def _make_on_log(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue):
+    """Create on_log callback that's efficient from both event loop and threads."""
+    loop_thread_id = threading.get_ident()
+
+    def on_log(entry: HistoryEntry):
+        if threading.get_ident() == loop_thread_id:
+            queue.put_nowait(entry)
+        else:
+            loop.call_soon_threadsafe(queue.put_nowait, entry)
+
+    return on_log
 
 
 def ui_event_to_sse(ev: UIEvent) -> str:
@@ -443,7 +537,7 @@ def iterate_result_to_sse(result: IterateResult, run_id: str) -> str:
 async def stream_run(req: RunRequest):
     queue = asyncio.Queue()
     sse_queue = asyncio.Queue()  # For tool_request events in sandbox mode
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     run_id = str(uuid.uuid4())[:8]
     session_id = req.sandbox_session_id or run_id
     event_filter = EventFilter(run_id, mode=req.mode)
@@ -454,8 +548,7 @@ async def stream_run(req: RunRequest):
     # Common kwargs for run doc saves
     fs_common = dict(run_id=run_id, task=req.task, user_id=req.user_id, mode=req.mode, provider=req.provider)
 
-    def on_log(entry: HistoryEntry):
-        loop.call_soon_threadsafe(queue.put_nowait, entry)
+    on_log = _make_on_log(loop, queue)
 
     def emit_sandbox_event(event_type: str, data: dict):
         loop.call_soon_threadsafe(sse_queue.put_nowait, UIEvent(event_type, data))
@@ -494,13 +587,15 @@ async def stream_run(req: RunRequest):
     # Build provider config with thinking level
     provider_config = _build_provider_config(req.provider, req.thinking_level, req.api_key)
 
-    harness = RLHarness(
+    harness = AsyncRLHarness(
         provider=provider_config,
         enable_search=req.enable_search,
         enable_bash=enable_bash,
         enable_code=enable_code,
+        enable_ask_user=req.enable_ask_user,
         code_executor=code_executor,
         artifacts_dir=req.artifacts_dir,
+        skills_dir=req.skills_dir,
         max_iterations=req.max_iterations,
         on_event=on_log,
         stream=True,
@@ -511,7 +606,7 @@ async def stream_run(req: RunRequest):
     provider_sessions[session_id] = harness.provider
 
     # Create Firestore run doc (non-blocking)
-    fs_doc(loop, **fs_common, rubric=req.rubric, status="executing", is_initial=True)
+    fs_doc(**fs_common, rubric=req.rubric, status="executing", is_initial=True)
 
     # Emit run_start
     start_data: dict = {"run_id": run_id, "session_id": session_id, "task": req.task, "mode": req.mode}
@@ -523,9 +618,7 @@ async def stream_run(req: RunRequest):
     plan = req.plan
     if req.mode == "plan" and not plan:
         try:
-            brief, plan = await loop.run_in_executor(
-                executor, lambda: _create_plan(harness.provider, req.task, req.enable_search)
-            )
+            brief, plan = await _create_plan(harness.provider, req.task, req.enable_search)
             ev = UIEvent("plan_created", {"brief": brief, "plan": plan})
             accumulator.process(ev)
             yield ui_event_to_sse(ev)
@@ -533,22 +626,18 @@ async def stream_run(req: RunRequest):
             yield ui_event_to_sse(UIEvent("error", {"message": f"Plan creation failed: {e}"}))
             return
 
-    def run_task():
-        return harness.run_single(
-            prompt,
-            req.ground_truth,
-            mode=req.mode,
-            checkpoint=req.checkpoint,
-            plan=plan,
-            rubric=req.rubric,
-            num_takes=req.num_takes or 0,
-        )
-
     # Emit client-provided rubric immediately (won't come from tool call)
     if req.rubric:
         yield ui_event_to_sse(UIEvent("rubric", {"run_id": run_id, "content": req.rubric}))
 
-    future = loop.run_in_executor(executor, run_task)
+    async def _run():
+        return await harness.run_single(
+            prompt, req.ground_truth,
+            mode=req.mode, checkpoint=req.checkpoint,
+            plan=plan, rubric=req.rubric, num_takes=req.num_takes or 0,
+        )
+
+    future = asyncio.create_task(_run())
 
     # Save result to Firestore even if client disconnects (SSE stream closes)
     def _on_done(fut):
@@ -556,9 +645,9 @@ async def stream_run(req: RunRequest):
             res = fut.result()
             if res.rubric:
                 rubric_store[run_id] = res.rubric
-            fs_doc(loop, **fs_common, rubric=res.rubric, result=res, status="completed")
-        except Exception as exc:
-            fs_doc(loop, **fs_common, status="error", error=str(exc))
+            fs_doc(**fs_common, rubric=res.rubric, result=res, status="completed")
+        except BaseException as exc:
+            fs_doc(**fs_common, status="error", error=str(exc))
 
     future.add_done_callback(_on_done)
 
@@ -620,7 +709,7 @@ async def stream_run(req: RunRequest):
         yield result_to_sse(result, run_id=run_id, mode=req.mode, briefs=event_filter.briefs)
 
     finally:
-        fs_categories(loop, run_id, accumulator.to_docs())
+        fs_categories(run_id, accumulator.to_docs())
         accumulator_sessions.pop(session_id, None)
         provider_sessions.pop(session_id, None)
         if req.sandbox_mode:
@@ -637,7 +726,7 @@ async def run(req: RunRequest, request: Request):
 
 async def stream_iterate(req: IterateRequest):
     queue = asyncio.Queue()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     run_id = str(uuid.uuid4())[:8]
     session_id = run_id  # Use run_id as session for iterate
     event_filter = EventFilter(run_id)
@@ -646,17 +735,17 @@ async def stream_iterate(req: IterateRequest):
 
     fs_common = dict(run_id=run_id, task=req.task, user_id=req.user_id, mode="iterate", provider=req.provider)
 
-    def on_log(entry: HistoryEntry):
-        loop.call_soon_threadsafe(queue.put_nowait, entry)
+    on_log = _make_on_log(loop, queue)
 
     provider_config = _build_provider_config(req.provider, req.thinking_level, req.api_key)
 
     code_executor = SubprocessExecutor(req.artifacts_dir) if req.enable_code else None
-    harness = RLHarness(
+    harness = AsyncRLHarness(
         provider=provider_config,
         enable_search=req.enable_search,
         enable_bash=req.enable_bash,
         enable_code=req.enable_code,
+        enable_ask_user=req.enable_ask_user,
         code_executor=code_executor,
         artifacts_dir=req.artifacts_dir,
         max_iterations=req.max_iterations,
@@ -668,8 +757,8 @@ async def stream_iterate(req: IterateRequest):
     # Store provider for user question responses
     provider_sessions[session_id] = harness.provider
 
-    def run_iterate():
-        return harness.iterate(
+    async def run_iterate():
+        return await harness.iterate(
             task=req.task,
             answer=req.answer,
             rubric=req.rubric,
@@ -679,21 +768,21 @@ async def stream_iterate(req: IterateRequest):
         )
 
     # Create Firestore run doc (non-blocking)
-    fs_doc(loop, **fs_common, rubric=req.rubric, status="executing", is_initial=True)
+    fs_doc(**fs_common, rubric=req.rubric, status="executing", is_initial=True)
 
     # Emit iterate_start
     yield ui_event_to_sse(UIEvent("iterate_start", {"run_id": run_id, "session_id": session_id, "task": req.task}))
 
-    future = loop.run_in_executor(executor, run_iterate)
+    future = asyncio.create_task(run_iterate())
 
     # Save result to Firestore even if client disconnects
     def _on_done(fut):
         try:
             res = fut.result()
             run_result = RunResult(task=req.task, ground_truth="", answer=res.answer, rubric=res.rubric)
-            fs_doc(loop, **fs_common, rubric=res.rubric, result=run_result, status="completed")
-        except Exception as exc:
-            fs_doc(loop, **fs_common, status="error", error=str(exc))
+            fs_doc(**fs_common, rubric=res.rubric, result=run_result, status="completed")
+        except BaseException as exc:
+            fs_doc(**fs_common, status="error", error=str(exc))
 
     future.add_done_callback(_on_done)
 
@@ -740,7 +829,7 @@ async def stream_iterate(req: IterateRequest):
         yield iterate_result_to_sse(result, run_id)
 
     finally:
-        fs_categories(loop, run_id, accumulator.to_docs())
+        fs_categories(run_id, accumulator.to_docs())
         provider_sessions.pop(session_id, None)
 
 
@@ -765,7 +854,7 @@ async def stream_resume(req: ResumeRequest):
     session.last_accessed = time.time()
     harness = session.harness
     queue = asyncio.Queue()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     run_id = str(uuid.uuid4())[:8]
     event_filter = EventFilter(run_id)
 
@@ -777,37 +866,36 @@ async def stream_resume(req: ResumeRequest):
         user_id=req.user_id, mode="resume", provider=cfg.get("provider", "gemini"),
     )
 
-    def on_log(entry: HistoryEntry):
-        loop.call_soon_threadsafe(queue.put_nowait, entry)
+    on_log = _make_on_log(loop, queue)
 
     # Re-wire logging to new queue
     harness.provider.on_log = on_log
 
     # Create Firestore run doc (non-blocking)
-    fs_doc(loop, **fs_common, status="executing", is_initial=True)
+    fs_doc(**fs_common, status="executing", is_initial=True)
 
     yield ui_event_to_sse(UIEvent("resume_start", {
         "run_id": run_id, "session_id": req.session_id,
         "checkpoint_id": req.checkpoint_id, "feedback": req.feedback,
     }))
 
-    def run_resume():
-        return harness.resume(
+    async def run_resume():
+        return await harness.resume(
             checkpoint_id=req.checkpoint_id,
             feedback=req.feedback,
             rubric_update=req.rubric_update or req.feedback,
             ground_truth=req.ground_truth,
         )
 
-    future = loop.run_in_executor(executor, run_resume)
+    future = asyncio.create_task(run_resume())
 
     # Save result to Firestore even if client disconnects
     def _on_done(fut):
         try:
             res = fut.result()
-            fs_doc(loop, **fs_common, rubric=res.rubric, result=res, status="completed")
-        except Exception as exc:
-            fs_doc(loop, **fs_common, status="error", error=str(exc))
+            fs_doc(**fs_common, rubric=res.rubric, result=res, status="completed")
+        except BaseException as exc:
+            fs_doc(**fs_common, status="error", error=str(exc))
 
     future.add_done_callback(_on_done)
 
@@ -843,7 +931,7 @@ async def stream_resume(req: ResumeRequest):
         }))
         yield result_to_sse(result, run_id=run_id)
     finally:
-        fs_categories(loop, run_id, accumulator.to_docs())
+        fs_categories(run_id, accumulator.to_docs())
         session.busy = False
 
 
@@ -855,19 +943,19 @@ async def resume(req: ResumeRequest):
 # ─── Other endpoints ─────────────────────────────────────────────────────────
 
 @app.post("/rubric/edit")
-def rubric_edit(req: RubricEditRequest):
+async def rubric_edit(req: RubricEditRequest):
     key = req.plan_id or "default"
     rubric_store[key] = req.rubric
     return {"ok": True, "plan_id": key}
 
 
 @app.get("/rubric/{plan_id}")
-def rubric_get(plan_id: str):
+async def rubric_get(plan_id: str):
     return {"rubric": rubric_store.get(plan_id, "")}
 
 
 @app.get("/checkpoints/{session_id}")
-def get_checkpoints(session_id: str):
+async def get_checkpoints(session_id: str):
     session = session_store.get(session_id)
     if not session:
         return {"error": "Session not found"}
@@ -893,13 +981,20 @@ async def _cleanup_sessions():
             session_store.pop(k, None)
 
 
-@app.on_event("startup")
-async def _start_cleanup():
-    asyncio.create_task(_cleanup_sessions())
+@app.get("/skills")
+async def list_skills(skills_dir: str = "./skills"):
+    """List available skills from the skills directory."""
+    skills = parse_skills(skills_dir)
+    return {
+        "skills": [
+            {"name": s.name, "type": s.type, "description": s.description, "dir": s.dir_path}
+            for s in skills
+        ],
+    }
 
 
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
 
 

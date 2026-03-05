@@ -1,4 +1,4 @@
-"""Firebase integration for RL Harness."""
+"""Firebase integration for RL Harness — async."""
 
 from typing import Optional, TYPE_CHECKING
 
@@ -12,7 +12,11 @@ if TYPE_CHECKING:
 # --- Firebase Initialization ---
 cred = credentials.Certificate("creds/cliokwh-firebase.json")
 firebase_admin.initialize_app(cred)
-db = firestore.client(database_id='ckwh')
+db = firestore.AsyncClient(
+    credentials=cred.get_credential(),
+    project=cred.project_id,
+    database='ckwh',
+)
 
 
 # --- Helper Functions ---
@@ -21,8 +25,8 @@ def sanitize(obj):
     """Recursively strip None values (Firestore rejects them)."""
     if obj is None:
         return None
-    if obj is firestore.SERVER_TIMESTAMP:                                                                                                                    
-        return obj 
+    if obj is firestore.SERVER_TIMESTAMP:
+        return obj
     if isinstance(obj, list):
         return [sanitize(item) for item in obj]
     if isinstance(obj, dict):
@@ -30,7 +34,7 @@ def sanitize(obj):
     return obj
 
 
-def save_run_doc(
+async def save_run_doc(
     run_id: str,
     task: str,
     user_id: str,
@@ -42,7 +46,7 @@ def save_run_doc(
     error: Optional[str] = None,
     is_initial: bool = False,
 ):
-    """Save/update run document fields. No events — those go to subcollection."""
+    """Save/update run document fields."""
     from verif.harness import RunResult  # noqa: F811
 
     doc_ref = db.collection("runs").document(run_id)
@@ -70,12 +74,12 @@ def save_run_doc(
             "rubric": result.rubric,
         }
 
-    doc_ref.set(sanitize(data), merge=True)
+    await doc_ref.set(sanitize(data), merge=True)
 
 
-def save_event_categories(run_id: str, categories: dict[str, dict]):
+async def save_event_categories(run_id: str, categories: dict[str, dict]):
     """Write category docs to runs/{runId}/events/{category}."""
     events_col = db.collection("runs").document(run_id).collection("events")
     for doc_id, data in categories.items():
         data["createdAt"] = firestore.SERVER_TIMESTAMP
-        events_col.document(doc_id).set(sanitize(data))
+        await events_col.document(doc_id).set(sanitize(data))

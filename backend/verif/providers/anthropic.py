@@ -1,11 +1,12 @@
 import os
 import json
 import base64
+import asyncio
 import logging
 import mimetypes
 import anthropic
 
-from .base import BaseProvider, FunctionCall, TOOL_DEFINITIONS, retry_on_error
+from .base import BaseProvider, FunctionCall, TOOL_DEFINITIONS, retry_on_error, async_retry_on_error
 from ..prompts import SEARCH_AGENT
 from ..config import Prompt, Attachment
 from dotenv import load_dotenv
@@ -39,11 +40,13 @@ WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_use
 class AnthropicProvider(BaseProvider):
     provider_name = "anthropic"
 
-    def __init__(self, thinking_budget: int = 10000):
+    def __init__(self, thinking_budget: int = 10000,
+                 client: anthropic.Anthropic | None = None,
+                 async_client: anthropic.AsyncAnthropic | None = None):
         super().__init__()
-        self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.client = client or anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.async_client = async_client or anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         self.thinking_budget = thinking_budget
-        self._verification_called = False
 
     def _debug_log(self, message: str):
         debug_logger.error(message)
@@ -147,17 +150,113 @@ class AnthropicProvider(BaseProvider):
 
         return "".join(text_parts), func_calls, content_blocks
 
+    # === Async streaming ===
+    async def _stream_generate_async(
+        self,
+        messages: list,
+        system: str = "",
+        tools: list = None,
+        tool_choice: dict = None,
+        event_type: str = "model_chunk",
+        meta: dict = None,
+        extract_function_calls: bool = False,
+    ) -> tuple[str, list[FunctionCall], list]:
+        """Native async streaming via async_client. Same logic as _stream_generate."""
+        func_calls = []
+        text_parts = []
+        content_blocks = []
+        meta = meta or {}
+
+        current_block = None
+        current_tool_input_json = ""
+        current_thinking_signature = ""
+
+        kwargs = {
+            "model": MODEL_ID,
+            "max_tokens": 128000,
+            "messages": messages,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
+        }
+        if system:
+            kwargs["system"] = system
+        if tools:
+            kwargs["tools"] = tools
+        if tool_choice:
+            kwargs["tool_choice"] = tool_choice
+
+        async with self.async_client.messages.stream(**kwargs) as stream:
+            async for event in stream:
+                if event.type == "content_block_start":
+                    current_block = event.content_block
+                    current_tool_input_json = ""
+                    current_thinking_signature = ""
+
+                elif event.type == "content_block_delta":
+                    delta = event.delta
+                    if delta.type == "text_delta":
+                        text_parts.append(delta.text)
+                        self.emit(event_type, delta.text, meta if meta else None)
+                    elif extract_function_calls and delta.type == "thinking_delta":
+                        self.emit("thinking", delta.thinking)
+                    elif delta.type == "input_json_delta":
+                        current_tool_input_json += delta.partial_json
+
+                elif event.type == "signature":
+                    current_thinking_signature = event.signature
+
+                elif event.type == "content_block_stop":
+                    if current_block is not None:
+                        if current_block.type == "text":
+                            final_text = getattr(event.content_block, "text", "") if hasattr(event, "content_block") else ""
+                            content_blocks.append({"type": "text", "text": final_text})
+                        elif current_block.type == "thinking":
+                            cb = event.content_block if hasattr(event, "content_block") else current_block
+                            content_blocks.append({
+                                "type": "thinking",
+                                "thinking": getattr(cb, "thinking", ""),
+                                "signature": getattr(cb, "signature", "") or current_thinking_signature,
+                            })
+                        elif current_block.type == "tool_use":
+                            args = json.loads(current_tool_input_json) if current_tool_input_json else {}
+                            block = {
+                                "type": "tool_use",
+                                "id": current_block.id,
+                                "name": current_block.name,
+                                "input": args,
+                            }
+                            content_blocks.append(block)
+                            if extract_function_calls:
+                                func_calls.append(FunctionCall(
+                                    name=current_block.name,
+                                    args=args,
+                                    raw=block,
+                                ))
+                                self.log("tool_call", f"{current_block.name}({args})")
+                        elif current_block.type == "server_tool_use":
+                            self.emit("tool_call", f"web_search({getattr(current_block, 'input', {})})")
+                        elif current_block.type == "web_search_tool_result":
+                            n = len(current_block.content) if hasattr(current_block, "content") and current_block.content else 0
+                            self.emit("tool_response", f"web_search -> {n} results")
+                    current_block = None
+
+        return "".join(text_parts), func_calls, content_blocks
+
     # === LLM calls ===
     def generate(self, prompt: str, system: str = None, _log: bool = True, enable_search: bool = False,
                  stream: bool = False, subagent_id: str = None, stream_event_type: str = None,
-                 stream_meta: dict = None) -> str:
+                 stream_meta: dict = None, tools: list[str] = None, _tool_depth: int = 0) -> str:
         if _log:
             self.log("user", prompt)
             if system:
                 self.log("system", system)
 
         messages = [{"role": "user", "content": prompt}]
-        tools = [WEB_SEARCH_TOOL] if enable_search else None
+        api_tools = None
+        if enable_search:
+            api_tools = [WEB_SEARCH_TOOL]
+        if tools:
+            api_tools = [_to_anthropic_tool(self.get_tool_definition(t)) for t in tools]
 
         # Streaming path - emit events without storing in history
         if stream:
@@ -169,7 +268,7 @@ class AnthropicProvider(BaseProvider):
             text, _, _ = self._stream_generate(
                 messages=messages,
                 system=system or "",
-                tools=tools,
+                tools=api_tools,
                 event_type=event_type,
                 meta=meta,
             )
@@ -187,8 +286,8 @@ class AnthropicProvider(BaseProvider):
         }
         if system:
             kwargs["system"] = system
-        if tools:
-            kwargs["tools"] = tools
+        if api_tools:
+            kwargs["tools"] = api_tools
 
         try:
             response = retry_on_error(
@@ -204,6 +303,22 @@ class AnthropicProvider(BaseProvider):
         if _log:
             self._log_response(response)
 
+        # If model made tool calls, execute and synthesize
+        if tools:
+            func_calls = [b for b in response.content if b.type == "tool_use"]
+            if func_calls:
+                results = []
+                for fc in func_calls:
+                    self.log("tool_call", f"delegate:{fc.name}({fc.input})")
+                    result = self._execute_tool(fc.name, fc.input or {})
+                    self.log("tool_response", f"delegate:{fc.name} -> {result}")
+                    results.append(f"{fc.name}: {result}")
+                next_tools = tools if _tool_depth < 5 else None
+                return self.generate(
+                    prompt + "\n\nTool results:\n" + "\n".join(results),
+                    system=system, _log=False, tools=next_tools, _tool_depth=_tool_depth + 1,
+                )
+
         return self._extract_text_with_citations(response)
 
     def search(self, query: str, stream: bool = False, subagent_id: str = None) -> str:
@@ -217,10 +332,127 @@ class AnthropicProvider(BaseProvider):
             subagent_id=subagent_id,
         )
 
+    async def generate_async(
+        self,
+        prompt: str,
+        system: str = None,
+        _log: bool = True,
+        enable_search: bool = False,
+        stream: bool = False,
+        subagent_id: str = None,
+        stream_event_type: str = None,
+        stream_meta: dict = None,
+        tools: list[str] = None,
+        _tool_depth: int = 0,
+    ) -> str:
+        if stream:
+            if _log:
+                self.log("user", prompt)
+                if system:
+                    self.log("system", system)
+            messages = [{"role": "user", "content": prompt}]
+            api_tools = None
+            if enable_search:
+                api_tools = [WEB_SEARCH_TOOL]
+            if tools:
+                api_tools = [_to_anthropic_tool(self.get_tool_definition(t)) for t in tools]
+            event_type = stream_event_type or "subagent_chunk"
+            is_subagent = not stream_event_type
+            meta = stream_meta or ({"subagent_id": subagent_id} if subagent_id else {})
+            if is_subagent:
+                self.emit("subagent_start", prompt, meta)
+            text, _, _ = await self._stream_generate_async(
+                messages=messages,
+                system=system or "",
+                tools=api_tools,
+                event_type=event_type,
+                meta=meta,
+            )
+            if is_subagent:
+                self.emit("subagent_end", text, meta)
+            return text
+
+        if _log:
+            self.log("user", prompt)
+            if system:
+                self.log("system", system)
+
+        messages = [{"role": "user", "content": prompt}]
+        api_tools = None
+        if enable_search:
+            api_tools = [WEB_SEARCH_TOOL]
+        if tools:
+            api_tools = [_to_anthropic_tool(self.get_tool_definition(t)) for t in tools]
+
+        kwargs = {
+            "model": MODEL_ID,
+            "max_tokens": 128000,
+            "messages": messages,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
+        }
+        if system:
+            kwargs["system"] = system
+        if api_tools:
+            kwargs["tools"] = api_tools
+
+        try:
+            response = await async_retry_on_error(
+                lambda: self._generate_with_pause_async(kwargs),
+                logger=debug_logger,
+            )
+        except Exception as e:
+            debug_logger.error(f"generate_async() failed | prompt: {prompt[:200]}... | error: {e}")
+            if _log:
+                self.log("tool_error", f"generate: {e}")
+            raise
+
+        if _log:
+            self._log_response(response)
+
+        if tools:
+            func_calls = [b for b in response.content if b.type == "tool_use"]
+            if func_calls:
+                results = []
+                for fc in func_calls:
+                    self.log("tool_call", f"delegate:{fc.name}({fc.input})")
+                    result = await self._execute_tool_async(fc.name, fc.input or {})
+                    self.log("tool_response", f"delegate:{fc.name} -> {result}")
+                    results.append(f"{fc.name}: {result}")
+                next_tools = tools if _tool_depth < 5 else None
+                return await self.generate_async(
+                    prompt + "\n\nTool results:\n" + "\n".join(results),
+                    system=system,
+                    _log=False,
+                    tools=next_tools,
+                    _tool_depth=_tool_depth + 1,
+                )
+
+        return self._extract_text_with_citations(response)
+
+    async def search_async(self, query: str, stream: bool = False, subagent_id: str = None) -> str:
+        if stream:
+            return await self.generate_async(
+                query, system=SEARCH_AGENT, _log=False,
+                enable_search=True, stream=True, subagent_id=subagent_id,
+            )
+        return await self.generate_async(
+            query,
+            system=SEARCH_AGENT,
+            _log=False,
+            enable_search=True,
+            stream=False,
+            subagent_id=subagent_id,
+        )
+
     def _create(self, **kwargs):
         """Stream-backed blocking call (required for large max_tokens)."""
         with self.client.messages.stream(**kwargs) as s:
             return s.get_final_message()
+
+    async def _create_async(self, **kwargs):
+        """Async create call."""
+        return await self.async_client.messages.create(**kwargs)
 
     def _generate_with_pause(self, kwargs: dict):
         """Handle pause_turn stop reason by continuing the conversation."""
@@ -231,6 +463,17 @@ class AnthropicProvider(BaseProvider):
                 {"role": "user", "content": "Continue."},
             ]
             response = self._create(**kwargs)
+        return response
+
+    async def _generate_with_pause_async(self, kwargs: dict):
+        """Handle pause_turn stop reason by continuing the conversation (async)."""
+        response = await self._create_async(**kwargs)
+        while response.stop_reason == "pause_turn":
+            kwargs["messages"] = kwargs["messages"] + [
+                {"role": "assistant", "content": response.content},
+                {"role": "user", "content": "Continue."},
+            ]
+            response = await self._create_async(**kwargs)
         return response
 
     def read_file_with_vision(self, file_path: str, prompt: str) -> str:
@@ -437,6 +680,75 @@ class AnthropicProvider(BaseProvider):
 
         # Append full assistant message to context
         # Convert response.content to serializable dicts
+        assistant_content = []
+        for block in response.content:
+            if block.type == "thinking":
+                assistant_content.append({
+                    "type": "thinking",
+                    "thinking": block.thinking,
+                    "signature": block.signature,
+                })
+            elif block.type == "text":
+                assistant_content.append({"type": "text", "text": block.text})
+            elif block.type == "tool_use":
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                })
+        context["messages"].append({"role": "assistant", "content": assistant_content})
+
+        return func_calls, self._extract_text(response)
+
+    async def _call_model_async(self, context: dict, step_desc: str, stream: bool = False) -> tuple[list[FunctionCall], str]:
+        if stream:
+            if self._verification_called:
+                context["tool_choice"] = {"type": "auto"}
+            text, func_calls, content_blocks = await self._stream_generate_async(
+                messages=context["messages"],
+                system=context["system"],
+                tools=context["tools"],
+                tool_choice=context["tool_choice"],
+                event_type="model_chunk",
+                extract_function_calls=True,
+            )
+            if content_blocks:
+                context["messages"].append({"role": "assistant", "content": content_blocks})
+            return func_calls, text
+
+        if self._verification_called:
+            context["tool_choice"] = {"type": "auto"}
+
+        kwargs = {
+            "model": MODEL_ID,
+            "max_tokens": 128000,
+            "system": context["system"],
+            "messages": context["messages"],
+            "tools": context["tools"],
+            "tool_choice": context["tool_choice"],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
+        }
+
+        response = await async_retry_on_error(
+            lambda: self._create_async(**kwargs),
+            logger=debug_logger,
+        )
+        self._log_response(response)
+
+        func_calls = []
+        for block in response.content:
+            if block.type == "tool_use":
+                func_calls.append(FunctionCall(
+                    name=block.name,
+                    args=block.input or {},
+                    raw=block,
+                ))
+
+        if not func_calls:
+            return [], self._extract_text(response)
+
         assistant_content = []
         for block in response.content:
             if block.type == "thinking":

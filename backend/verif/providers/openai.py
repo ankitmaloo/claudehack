@@ -1,9 +1,10 @@
 import os
 import json
 import logging
-from openai import OpenAI
+import asyncio
+from openai import OpenAI, AsyncOpenAI
 
-from .base import BaseProvider, FunctionCall, TOOL_DEFINITIONS, retry_on_error
+from .base import BaseProvider, FunctionCall, TOOL_DEFINITIONS, retry_on_error, async_retry_on_error
 from ..prompts import SEARCH_AGENT
 from ..config import Prompt, Attachment
 
@@ -34,9 +35,11 @@ def _to_openai_tool(tool_def: dict) -> dict:
 class OpenAIProvider(BaseProvider):
     provider_name = "openai"
 
-    def __init__(self, reasoning_effort: str = "medium"):
+    def __init__(self, reasoning_effort: str = "medium",
+                 client: OpenAI | None = None, async_client: AsyncOpenAI | None = None):
         super().__init__()
-        self.client = OpenAI(api_key=OPENAI_API_KEY)
+        self.client = client or OpenAI(api_key=OPENAI_API_KEY)
+        self.async_client = async_client or AsyncOpenAI(api_key=OPENAI_API_KEY)
         self.reasoning_effort = reasoning_effort
 
     def _debug_log(self, message: str):
@@ -59,6 +62,7 @@ class OpenAIProvider(BaseProvider):
         """
         func_calls_by_idx = {}
         text_parts = []
+        thinking_parts = []
         response_output = []
         meta = meta or {}
 
@@ -76,7 +80,8 @@ class OpenAIProvider(BaseProvider):
                 text_parts.append(event.delta)
                 self.emit(event_type, event.delta, meta if meta else None)
 
-            elif extract_function_calls and event.type == "response.reasoning_summary_part.delta":
+            elif extract_function_calls and event.type == "response.reasoning_summary_text.delta":
+                thinking_parts.append(event.delta)
                 self.emit("thinking", event.delta)
 
             elif extract_function_calls and event.type == "response.output_item.added":
@@ -93,7 +98,79 @@ class OpenAIProvider(BaseProvider):
 
             elif event.type == "response.output_item.done":
                 response_output.append(event.item)
-                # Log tool_call with full arguments when function call is complete
+                if extract_function_calls and hasattr(event.item, "type") and event.item.type == "reasoning" and thinking_parts:
+                    self.log("thinking", "".join(thinking_parts))
+                    thinking_parts.clear()
+                if extract_function_calls and event.output_index in func_calls_by_idx:
+                    fc_data = func_calls_by_idx[event.output_index]
+                    self.log("tool_call", f"{fc_data['item'].name}({fc_data['arguments']})")
+
+            elif event.type == "response.completed":
+                break
+
+        func_calls = [
+            FunctionCall(
+                name=fc_data["item"].name,
+                args=json.loads(fc_data["arguments"]) if fc_data["arguments"] else {},
+                raw=fc_data["item"]
+            )
+            for fc_data in func_calls_by_idx.values()
+        ]
+
+        return "".join(text_parts), func_calls, response_output
+
+    # === Async streaming ===
+    async def _stream_generate_async(
+        self,
+        input_messages: list,
+        tools: list = None,
+        event_type: str = "model_chunk",
+        meta: dict = None,
+        extract_function_calls: bool = False,
+    ) -> tuple[str, list[FunctionCall], list]:
+        """Native async streaming via async_client. Same logic as _stream_generate."""
+        func_calls_by_idx = {}
+        text_parts = []
+        thinking_parts = []
+        response_output = []
+        meta = meta or {}
+
+        kwargs = {
+            "model": MODEL_ID,
+            "input": input_messages,
+            "reasoning": {"effort": self.reasoning_effort, "summary": "auto"},
+            "stream": True,
+        }
+        if tools:
+            kwargs["tools"] = tools
+
+        stream = await self.async_client.responses.create(**kwargs)
+        async for event in stream:
+            if event.type == "response.output_text.delta":
+                text_parts.append(event.delta)
+                self.emit(event_type, event.delta, meta if meta else None)
+
+            elif extract_function_calls and event.type == "response.reasoning_summary_text.delta":
+                thinking_parts.append(event.delta)
+                self.emit("thinking", event.delta)
+
+            elif extract_function_calls and event.type == "response.output_item.added":
+                if hasattr(event.item, "type") and event.item.type == "function_call":
+                    func_calls_by_idx[event.output_index] = {
+                        "item": event.item,
+                        "arguments": ""
+                    }
+
+            elif extract_function_calls and event.type == "response.function_call_arguments.delta":
+                idx = event.output_index
+                if idx in func_calls_by_idx:
+                    func_calls_by_idx[idx]["arguments"] += event.delta
+
+            elif event.type == "response.output_item.done":
+                response_output.append(event.item)
+                if extract_function_calls and hasattr(event.item, "type") and event.item.type == "reasoning" and thinking_parts:
+                    self.log("thinking", "".join(thinking_parts))
+                    thinking_parts.clear()
                 if extract_function_calls and event.output_index in func_calls_by_idx:
                     fc_data = func_calls_by_idx[event.output_index]
                     self.log("tool_call", f"{fc_data['item'].name}({fc_data['arguments']})")
@@ -115,7 +192,7 @@ class OpenAIProvider(BaseProvider):
     # === LLM calls ===
     def generate(self, prompt: str, system: str = None, _log: bool = True, enable_search: bool = False,
                  stream: bool = False, subagent_id: str = None, stream_event_type: str = None,
-                 stream_meta: dict = None) -> str:
+                 stream_meta: dict = None, tools: list[str] = None, _tool_depth: int = 0) -> str:
         if _log:
             self.log("user", prompt)
             if system:
@@ -126,7 +203,11 @@ class OpenAIProvider(BaseProvider):
             input_messages.append({"role": "system", "content": system})
         input_messages.append({"role": "user", "content": prompt})
 
-        tools = [{"type": "web_search"}] if enable_search else None
+        oai_tools = None
+        if enable_search:
+            oai_tools = [{"type": "web_search"}]
+        if tools:
+            oai_tools = [_to_openai_tool(self.get_tool_definition(t)) for t in tools]
 
         # Streaming path - emit events without storing in history
         if stream:
@@ -137,7 +218,7 @@ class OpenAIProvider(BaseProvider):
                 self.emit("subagent_start", prompt, meta)
             text, _, _ = self._stream_generate(
                 input_messages=input_messages,
-                tools=tools,
+                tools=oai_tools,
                 event_type=event_type,
                 meta=meta,
             )
@@ -145,10 +226,10 @@ class OpenAIProvider(BaseProvider):
                 self.emit("subagent_end", text, meta)
             return text
 
-        # Blocking path (existing)
+        # Blocking path
         kwargs = {"model": MODEL_ID, "input": input_messages, "reasoning": {"effort": self.reasoning_effort, "summary": "auto"}}
-        if tools:
-            kwargs["tools"] = tools
+        if oai_tools:
+            kwargs["tools"] = oai_tools
 
         try:
             response = retry_on_error(lambda: self.client.responses.create(**kwargs), logger=debug_logger)
@@ -160,6 +241,24 @@ class OpenAIProvider(BaseProvider):
 
         if _log:
             self._log_response(response)
+
+        # If model made tool calls, execute and synthesize
+        if tools:
+            raw_func_calls = [item for item in response.output if item.type == "function_call"]
+            if raw_func_calls:
+                results = []
+                for fc in raw_func_calls:
+                    args = json.loads(fc.arguments) if fc.arguments else {}
+                    self.log("tool_call", f"delegate:{fc.name}({args})")
+                    result = self._execute_tool(fc.name, args)
+                    self.log("tool_response", f"delegate:{fc.name} -> {result}")
+                    results.append(f"{fc.name}: {result}")
+                next_tools = tools if _tool_depth < 5 else None
+                return self.generate(
+                    prompt + "\n\nTool results:\n" + "\n".join(results),
+                    system=system, _log=False, tools=next_tools, _tool_depth=_tool_depth + 1,
+                )
+
         return response.output_text or ""
 
     def search(self, query: str, stream: bool = False, subagent_id: str = None) -> str:
@@ -195,6 +294,146 @@ class OpenAIProvider(BaseProvider):
             )
         except Exception as e:
             debug_logger.error(f"search() failed | query: {query} | error: {e}")
+            self.log("tool_error", f"search: {e}")
+            raise
+        return response.output_text or ""
+
+    async def generate_async(
+        self,
+        prompt: str,
+        system: str = None,
+        _log: bool = True,
+        enable_search: bool = False,
+        stream: bool = False,
+        subagent_id: str = None,
+        stream_event_type: str = None,
+        stream_meta: dict = None,
+        tools: list[str] = None,
+        _tool_depth: int = 0,
+    ) -> str:
+        if stream:
+            if _log:
+                self.log("user", prompt)
+                if system:
+                    self.log("system", system)
+            input_messages = []
+            if system:
+                input_messages.append({"role": "system", "content": system})
+            input_messages.append({"role": "user", "content": prompt})
+            oai_tools = None
+            if enable_search:
+                oai_tools = [{"type": "web_search"}]
+            if tools:
+                oai_tools = [_to_openai_tool(self.get_tool_definition(t)) for t in tools]
+            event_type = stream_event_type or "subagent_chunk"
+            is_subagent = not stream_event_type
+            meta = stream_meta or ({"subagent_id": subagent_id} if subagent_id else {})
+            if is_subagent:
+                self.emit("subagent_start", prompt, meta)
+            text, _, _ = await self._stream_generate_async(
+                input_messages=input_messages,
+                tools=oai_tools,
+                event_type=event_type,
+                meta=meta,
+            )
+            if is_subagent:
+                self.emit("subagent_end", text, meta)
+            return text
+
+        if _log:
+            self.log("user", prompt)
+            if system:
+                self.log("system", system)
+
+        input_messages = []
+        if system:
+            input_messages.append({"role": "system", "content": system})
+        input_messages.append({"role": "user", "content": prompt})
+
+        oai_tools = None
+        if enable_search:
+            oai_tools = [{"type": "web_search"}]
+        if tools:
+            oai_tools = [_to_openai_tool(self.get_tool_definition(t)) for t in tools]
+
+        kwargs = {
+            "model": MODEL_ID,
+            "input": input_messages,
+            "reasoning": {"effort": self.reasoning_effort, "summary": "auto"},
+        }
+        if oai_tools:
+            kwargs["tools"] = oai_tools
+
+        try:
+            response = await async_retry_on_error(
+                lambda: self.async_client.responses.create(**kwargs),
+                logger=debug_logger,
+            )
+        except Exception as e:
+            debug_logger.error(f"generate_async() failed | prompt: {prompt[:200]}... | error: {e}")
+            if _log:
+                self.log("tool_error", f"generate: {e}")
+            raise
+
+        if _log:
+            self._log_response(response)
+
+        if tools:
+            raw_func_calls = [item for item in response.output if item.type == "function_call"]
+            if raw_func_calls:
+                results = []
+                for fc in raw_func_calls:
+                    args = json.loads(fc.arguments) if fc.arguments else {}
+                    self.log("tool_call", f"delegate:{fc.name}({args})")
+                    result = await self._execute_tool_async(fc.name, args)
+                    self.log("tool_response", f"delegate:{fc.name} -> {result}")
+                    results.append(f"{fc.name}: {result}")
+                next_tools = tools if _tool_depth < 5 else None
+                return await self.generate_async(
+                    prompt + "\n\nTool results:\n" + "\n".join(results),
+                    system=system,
+                    _log=False,
+                    tools=next_tools,
+                    _tool_depth=_tool_depth + 1,
+                )
+
+        return response.output_text or ""
+
+    async def search_async(self, query: str, stream: bool = False, subagent_id: str = None) -> str:
+        if stream:
+            input_messages = [
+                {"role": "system", "content": SEARCH_AGENT},
+                {"role": "user", "content": query},
+            ]
+            meta = {"subagent_id": subagent_id, "tool": "search_web"} if subagent_id else {}
+            self.emit("subagent_start", query, meta)
+            text, _, _ = await self._stream_generate_async(
+                input_messages=input_messages,
+                tools=[{"type": "web_search"}],
+                event_type="subagent_chunk",
+                meta=meta,
+            )
+            self.emit("subagent_end", text, meta)
+            return text
+
+        input_messages = [
+            {"role": "system", "content": SEARCH_AGENT},
+            {"role": "user", "content": query},
+        ]
+        tools = [{"type": "web_search"}]
+
+        try:
+            response = await async_retry_on_error(
+                lambda: self.async_client.responses.create(
+                    model=MODEL_ID,
+                    input=input_messages,
+                    tools=tools,
+                    reasoning={"effort": self.reasoning_effort, "summary": "auto"},
+                ),
+                logger=debug_logger,
+            )
+        except Exception as e:
+            debug_logger.error(f"search_async() failed | query: {query} | error: {e}")
             self.log("tool_error", f"search: {e}")
             raise
         return response.output_text or ""
@@ -426,6 +665,47 @@ class OpenAIProvider(BaseProvider):
                 name=fc.name,
                 args=json.loads(fc.arguments) if fc.arguments else {},
                 raw=fc
+            )
+            for fc in raw_func_calls
+        ]
+        return func_calls, response.output_text or ""
+
+    async def _call_model_async(self, context: dict, step_desc: str, stream: bool = False) -> tuple[list[FunctionCall], str]:
+        if stream:
+            text, func_calls, response_output = await self._stream_generate_async(
+                input_messages=context["messages"],
+                tools=context["tools"],
+                event_type="model_chunk",
+                extract_function_calls=True,
+            )
+            context["messages"] += response_output
+            return func_calls, text
+
+        response = await async_retry_on_error(
+            lambda: self.async_client.responses.create(
+                model=MODEL_ID,
+                input=context["messages"],
+                tools=context["tools"],
+                reasoning={"effort": self.reasoning_effort, "summary": "auto"},
+            ),
+            logger=debug_logger,
+        )
+        self._log_response(response)
+
+        raw_func_calls = [item for item in response.output if item.type == "function_call"]
+        if not raw_func_calls:
+            return [], response.output_text or ""
+
+        context["messages"] += response.output
+        for i, item in enumerate(response.output):
+            if item.type == "function_call":
+                debug_logger.debug(f"item[{i}] {item.name} call_id={item.call_id}")
+
+        func_calls = [
+            FunctionCall(
+                name=fc.name,
+                args=json.loads(fc.arguments) if fc.arguments else {},
+                raw=fc,
             )
             for fc in raw_func_calls
         ]
